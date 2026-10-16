@@ -72,10 +72,14 @@ local CONFIG: Config = {
 	-- repassado ao LiquidGlass (toggle e slider): distortion, elasticity, reflection,
 	-- transparency, speed, dispersion, stretch, pressScale, shadow, layers, tint
 	glass = {
-		distortion = 0.6,
+		transparency = 0.88, -- 1 = totalmente claro
+		distortion = 0.3, -- lente: mais alto = mais ampliação no centro
 		elasticity = 0.6,
-		reflection = 0.7,
-		dispersion = 0.5,
+		reflection = 0.9, -- brilho dos contornos
+		glow = 0.8, -- halo suave em volta do vidro
+		edge = 0.1, -- sombra interna (0 = vidro limpo)
+		dispersion = 0, -- franjas de cor (0 = sem)
+		layers = 1,
 	},
 	onSlide = function(value: number)
 		print("[TraxOS] slider:", value) -- troque pela sua lógica
@@ -822,7 +826,7 @@ if LiquidGlass ~= nil then
 			glassOptions({
 				name = "GlassToggle",
 				trackSize = Vector2.new(SWITCH_W, SWITCH_H),
-				knobSize = Vector2.new(34, 24),
+				knobSize = Vector2.new(36, 26),
 				anchorPoint = Vector2.new(1, 0),
 				position = UDim2.fromOffset(W - PAD, Y_TOGGLE + (ROW_H - SWITCH_H) / 2),
 				value = CONFIG.defaultToggle,
