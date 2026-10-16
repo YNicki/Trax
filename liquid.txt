@@ -248,10 +248,36 @@ local function register(object, priority)
 	startLoop()
 end
 
+-- Cada toque/clique pertence a UM componente. Se mais de um hit receber o mesmo
+-- evento (hits vizinhos, toque largo), fica com quem está de fato sob o dedo e o
+-- outro é cancelado sem disparar nada.
+local claims = setmetatable({}, { __mode = "k" }) -- InputObject -> { hit, cancel }
+
+local function contains(hit, input)
+	local gui = hit:FindFirstAncestorWhichIsA("ScreenGui")
+	local inset = (gui and gui.IgnoreGuiInset) and GuiService:GetGuiInset() or Vector2.new(0, 0)
+	local x, y = input.Position.X + inset.X, input.Position.Y + inset.Y
+	local pos, size = hit.AbsolutePosition, hit.AbsoluteSize
+	return x >= pos.X and x <= pos.X + size.X and y >= pos.Y and y <= pos.Y + size.Y
+end
+
 -- arrasto por Mouse e Toque. Devolve as conexões para limpar no Destroy.
-local function bindDrag(hit, onBegin, onMove, onEnd)
+-- onCancel (opcional) roda quando outro componente toma o toque; sem ele usa onEnd.
+local function bindDrag(hit, onBegin, onMove, onEnd, onCancel)
 	local active, token = false, nil
 	local conns = {}
+	local function cancel()
+		if not active then
+			return
+		end
+		local began = token
+		active, token = false, nil
+		if began and claims[began] and claims[began].hit == hit then
+			claims[began] = nil
+		end
+		local handler = onCancel or onEnd
+		handler(nil)
+	end
 	table.insert(
 		conns,
 		hit.InputBegan:Connect(function(input)
@@ -259,6 +285,15 @@ local function bindDrag(hit, onBegin, onMove, onEnd)
 			if active or not (kind == Enum.UserInputType.MouseButton1 or kind == Enum.UserInputType.Touch) then
 				return
 			end
+			local claim = claims[input]
+			if claim then
+				if contains(hit, input) and not contains(claim.hit, input) then
+					claim.cancel()
+				else
+					return
+				end
+			end
+			claims[input] = { hit = hit, cancel = cancel }
 			active, token = true, input
 			onBegin(input)
 		end)
@@ -284,7 +319,11 @@ local function bindDrag(hit, onBegin, onMove, onEnd)
 			local isMouse = input.UserInputType == Enum.UserInputType.MouseButton1
 				and token.UserInputType == Enum.UserInputType.MouseButton1
 			if input == token or isMouse then
+				local began = token
 				active, token = false, nil
+				if began and claims[began] and claims[began].hit == hit then
+					claims[began] = nil
+				end
 				onEnd(input)
 			end
 		end)
@@ -632,7 +671,7 @@ end
 
 function Glass:_lightTarget()
 	local p = pointer
-	if p then
+	if p and self._pressed then -- só o vidro tocado acompanha o dedo
 		if self._insetFix == nil then
 			local gui = self.Root:FindFirstAncestorWhichIsA("ScreenGui")
 			self._insetFix = (gui and gui.IgnoreGuiInset) and GuiService:GetGuiInset() or Vector2.new(0, 0)
@@ -980,6 +1019,12 @@ function LiquidGlass.Toggle(parent, options)
 		end
 		setState(newState, false, false)
 		glass:Impulse(newState and 0.5 or -0.5, 0)
+	end, function()
+		-- toque tomado por outro componente: solta sem alternar
+		dragging = false
+		glass:SetPressed(false)
+		spring.target = state and 1 or 0
+		settleTune()
 	end)
 
 	function self:Set(value, instant)
@@ -1142,6 +1187,10 @@ function LiquidGlass.Slider(parent, options)
 		glass:SetPressed(false)
 		spring:tune(5 * glass.cfg.speed, dampingFor(glass.cfg))
 		glass:Invalidate()
+	end, function()
+		glass:SetPressed(false)
+		spring:tune(5 * glass.cfg.speed, dampingFor(glass.cfg))
+		glass:Invalidate()
 	end)
 
 	function self:Set(newValue, instant)
@@ -1267,6 +1316,10 @@ function LiquidGlass.Orb(parent, options)
 			if not options.returnHome then
 				home = Vector2.new(px.target, py.target) -- fica onde foi solto
 			end
+			tuneSettle()
+		end, function()
+			dragging = false
+			glass:SetPressed(false)
 			tuneSettle()
 		end)
 	end
