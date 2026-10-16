@@ -72,16 +72,17 @@ local CONFIG: Config = {
 	-- repassado ao LiquidGlass (toggle e slider): distortion, elasticity, reflection,
 	-- transparency, speed, dispersion, stretch, pressScale, shadow, layers, tint
 	glass = {
-		transparency = 0.8, -- véu do vidro (1 = totalmente claro)
+		transparency = 0.7, -- véu branco do vidro (menor = mais branco, 1 = totalmente claro)
 		distortion = 0.75, -- ampliação do miolo e compressão da borda (a "distorção ao redor")
 		elasticity = 0.6,
-		reflection = 0.6, -- brilho dos contornos
-		glow = 0.3, -- halo suave em volta do vidro
-		specular = 0.2, -- reflexo pontual (0 = nenhum)
+		reflection = 0.8, -- brilho do contorno
+		glow = 0, -- halo em volta do vidro (0 = limpo)
+		specular = 0, -- reflexo pontual (0 = nenhum)
 		edge = 0, -- sombra interna (0 = vidro limpo)
 		dispersion = 0, -- franjas de cor (0 = sem)
 		layers = 2,
 		inner = Vector2.new(0.6, 0.74), -- tamanho do miolo da lente (X, Y)
+		solid = true, -- repouso branco; vira vidro ao tocar (false = sempre vidro)
 	},
 	onSlide = function(value: number)
 		print("[TraxOS] slider:", value) -- troque pela sua lógica
@@ -146,6 +147,10 @@ local COLOR = {
 	panel = Color3.fromRGB(28, 28, 30),
 	accent = CONFIG.accent,
 	on = Color3.fromRGB(48, 209, 88),
+	-- bolinha solta: branca, como as atividades do iOS 26
+	bubble = Color3.new(1, 1, 1),
+	bubbleTrack = Color3.fromRGB(214, 214, 220),
+	ink = Color3.fromRGB(28, 28, 30),
 }
 
 local FAMILY = "rbxasset://fonts/families/GothamSSm.json"
@@ -455,6 +460,11 @@ local bubble = apply(Instance.new("Frame"), {
 	Visible = false,
 }, stage)
 round(bubble, PILL)
+-- leve degradê para a bolinha branca não ficar chapada (multiplica a cor de fundo)
+apply(Instance.new("UIGradient"), {
+	Color = ColorSequence.new(Color3.new(1, 1, 1), Color3.fromRGB(228, 228, 233)),
+	Rotation = 90,
+}, bubble)
 local bubbleStroke = apply(Instance.new("UIStroke"), {
 	Color = COLOR.text,
 	Transparency = STROKE_T,
@@ -512,7 +522,7 @@ end
 
 local FULL = UDim2.new(1, -RING_INSET * 2, 1, -RING_INSET * 2)
 local HALF = UDim2.new(2, -RING_INSET * 2, 1, -RING_INSET * 2)
-ringCircle(ringHolder, "Track", UDim2.fromOffset(RING_INSET, RING_INSET), FULL, COLOR.track)
+ringCircle(ringHolder, "Track", UDim2.fromOffset(RING_INSET, RING_INSET), FULL, COLOR.bubbleTrack)
 
 local rightClip = apply(Instance.new("Frame"), {
 	Name = "RightClip",
@@ -619,6 +629,7 @@ local percentLabel = makeLabel(bubbleContent, {
 	Size = UDim2.fromOffset(BUBBLE, BUBBLE),
 	FontFace = FONT.bold,
 	TextSize = 10,
+	TextColor3 = COLOR.ink,
 	TextXAlignment = Enum.TextXAlignment.Center,
 	TextTruncate = Enum.TextTruncate.None,
 	Text = "0",
@@ -1053,6 +1064,11 @@ local function layoutBubble(a: number)
 	bubble.Position = UDim2.fromScale(left / STAGE_W, (stageH - height) / (2 * stageH))
 	bubble.Size = UDim2.fromScale(width / STAGE_W, height / stageH)
 
+	-- colada na ilha ela é preta; ao se soltar clareia até ficar branca
+	local whiten = clamp01((a - 0.55) / 0.3)
+	bubble.BackgroundColor3 = COLOR.bg:Lerp(COLOR.bubble, whiten)
+	bubbleStroke.Color = COLOR.text:Lerp(Color3.new(0, 0, 0), whiten)
+
 	-- pescoço: do centro da ponta da ilha ao centro da ponta esquerda da cápsula
 	local x1 = XR - BUBBLE / 2
 	local x2 = left + height / 2
@@ -1152,7 +1168,7 @@ local function renderActivity()
 
 	if wantIcon then
 		centerRef.name = iconName
-		centerRef.image.ImageColor3 = if kind == "active" then COLOR.on else COLOR.text
+		centerRef.image.ImageColor3 = if kind == "active" then COLOR.on else COLOR.ink
 		refreshIcon(centerRef)
 	else
 		centerRef.image.Visible = false
