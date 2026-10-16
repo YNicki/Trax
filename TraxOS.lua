@@ -44,6 +44,8 @@ type Config = {
 	defaultToggle: boolean,
 	defaultSlider: number,
 	glass: { [string]: any },
+	panelGlass: boolean,
+	panelTransparency: number,
 	onSlide: ((value: number) -> ())?,
 	idleCollapseSeconds: number,
 	topOffset: number,
@@ -84,6 +86,10 @@ local CONFIG: Config = {
 		inner = Vector2.new(0.6, 0.74), -- tamanho do miolo da lente (X, Y)
 		solid = true, -- repouso branco; vira vidro ao tocar (false = sempre vidro)
 	},
+	-- fundo da ilha aberta em vidro (para testes). O Roblox não borra o que está atrás da UI:
+	-- o efeito é um painel translúcido com degradê e contorno de vidro.
+	panelGlass = true,
+	panelTransparency = 0.3, -- 0 = opaco, 1 = invisível
 	onSlide = function(value: number)
 		print("[TraxOS] slider:", value) -- troque pela sua lógica
 	end,
@@ -151,6 +157,7 @@ local COLOR = {
 	bubble = Color3.new(1, 1, 1),
 	bubbleTrack = Color3.fromRGB(214, 214, 220),
 	ink = Color3.fromRGB(28, 28, 30),
+	glassPanel = Color3.fromRGB(44, 44, 52), -- cor do painel aberto em vidro
 }
 
 local FAMILY = "rbxasset://fonts/families/GothamSSm.json"
@@ -658,6 +665,21 @@ local islandStroke = apply(Instance.new("UIStroke"), {
 	ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
 }, island)
 local scale = apply(Instance.new("UIScale"), { Scale = 1 }, island)
+-- degradê do vidro: multiplica a cor do fundo (preto continua preto, então a pílula fechada não muda)
+apply(Instance.new("UIGradient"), {
+	Color = ColorSequence.new(Color3.new(1, 1, 1), Color3.fromRGB(150, 150, 160)),
+	Rotation = 90,
+}, island)
+-- contorno de vidro: forte em cima, some no meio, volta de leve embaixo (só com o painel aberto)
+local strokeGradient = apply(Instance.new("UIGradient"), {
+	Transparency = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, 0),
+		NumberSequenceKeypoint.new(0.5, 0.65),
+		NumberSequenceKeypoint.new(1, 0.3),
+	}),
+	Rotation = 90,
+	Enabled = false,
+}, islandStroke)
 
 -- vista compacta: logo + nome ---------------------------------------
 local compact = apply(Instance.new("CanvasGroup"), {
@@ -1023,6 +1045,7 @@ local bubbleA, bubbleFrom, bubbleTo = 0, 0, 0
 local bubbleStart, bubbleDur = 0, 1
 local bubbleBusy = false
 local bubbleGoal = 0
+local islandStrokeT: number = STROKE_T -- transparência-base do contorno da ilha (muda com o painel de vidro)
 
 local function touch()
 	lastTouch = os.clock()
@@ -1047,7 +1070,7 @@ local function layoutBubble(a: number)
 		bubble.Visible = false
 		neck.Visible = false
 		bubbleHit.Visible = false
-		islandStroke.Transparency = STROKE_T
+		islandStroke.Transparency = islandStrokeT
 		return
 	end
 
@@ -1091,9 +1114,8 @@ local function layoutBubble(a: number)
 
 	-- contornos somem durante o desgrude (senão o traço da ilha cortaria a bolinha)
 	local outline = 1 - clamp01(a / 0.12) * clamp01((0.98 - a) / 0.18)
-	local transparency = 1 - (1 - STROKE_T) * outline
-	islandStroke.Transparency = transparency
-	bubbleStroke.Transparency = transparency
+	islandStroke.Transparency = 1 - (1 - islandStrokeT) * outline
+	bubbleStroke.Transparency = 1 - (1 - STROKE_T) * outline
 end
 
 local function animateBubble(goal: number, delay: number, duration: number)
@@ -1282,7 +1304,15 @@ local function render()
 	end
 	shownExpanded = expanded
 
-	play(island, info, { Size = size })
+	local glassPanel = CONFIG.panelGlass and expanded
+	islandStrokeT = if glassPanel then 0.4 else STROKE_T
+	strokeGradient.Enabled = glassPanel
+	play(island, info, {
+		Size = size,
+		BackgroundTransparency = if glassPanel then CONFIG.panelTransparency else 0,
+		BackgroundColor3 = if glassPanel then COLOR.glassPanel else COLOR.bg,
+	})
+	play(islandStroke, FAST, { Transparency = islandStrokeT })
 	play(corner, info, { CornerRadius = UDim.new(0, radius) })
 	play(scale, FAST, { Scale = 1 })
 	hit.Visible = not expanded
