@@ -72,14 +72,16 @@ local CONFIG: Config = {
 	-- repassado ao LiquidGlass (toggle e slider): distortion, elasticity, reflection,
 	-- transparency, speed, dispersion, stretch, pressScale, shadow, layers, tint
 	glass = {
-		transparency = 0.88, -- 1 = totalmente claro
-		distortion = 0.3, -- lente: mais alto = mais ampliação no centro
+		transparency = 0.8, -- véu do vidro (1 = totalmente claro)
+		distortion = 0.75, -- ampliação do miolo e compressão da borda (a "distorção ao redor")
 		elasticity = 0.6,
-		reflection = 0.9, -- brilho dos contornos
-		glow = 0.8, -- halo suave em volta do vidro
-		edge = 0.1, -- sombra interna (0 = vidro limpo)
+		reflection = 0.6, -- brilho dos contornos
+		glow = 0.3, -- halo suave em volta do vidro
+		specular = 0.2, -- reflexo pontual (0 = nenhum)
+		edge = 0, -- sombra interna (0 = vidro limpo)
 		dispersion = 0, -- franjas de cor (0 = sem)
-		layers = 1,
+		layers = 2,
+		inner = Vector2.new(0.6, 0.74), -- tamanho do miolo da lente (X, Y)
 	},
 	onSlide = function(value: number)
 		print("[TraxOS] slider:", value) -- troque pela sua lógica
