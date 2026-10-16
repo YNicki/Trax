@@ -24,6 +24,10 @@
 	  shadow       bool   sombra suave
 	  layers       0..4   anéis da lente de refração (0 desliga)
 	  tint         Color3 cor do corpo
+	  solid        bool   repouso em pílula branca opaca; o vidro só aparece ao tocar/arrastar
+	  bars         bool   duas barras escuras (topo/base) dentro da lente, como no iOS
+	  sideWarp     0..1   (Toggle/Slider) o trilho ao lado "respira": achata/engrossa e se
+	                      deforma junto com o vidro enquanto ele é tocado
 
 	LIMITAÇÃO REAL DO ROBLOX (e o que este módulo faz no lugar)
 	  Uma UI não consegue ler o que já foi desenhado atrás dela: não há shader de
@@ -136,6 +140,8 @@ LiquidGlass.defaults = {
 	shadow = true,
 	layers = 3,
 	tint = WHITE,
+	solid = false,
+	bars = false,
 }
 
 function LiquidGlass.configure(partial)
@@ -394,6 +400,9 @@ function LiquidGlass.new(parent, options)
 		BorderSizePixel = 0,
 	}, body)
 	make("UICorner", { CornerRadius = PILL }, lens)
+	if cfg.solid then
+		lens.GroupTransparency = 1 -- em repouso só a pílula sólida aparece
+	end
 
 	local layerHolder = make("Frame", {
 		Name = "Layers",
@@ -434,10 +443,45 @@ function LiquidGlass.new(parent, options)
 	}, lens)
 	make("UICorner", { CornerRadius = PILL }, dot)
 
+	-- barras escuras de compressão (topo e base), típicas da lente do iOS
+	if cfg.bars then
+		for i = 1, 2 do
+			local bar = make("Frame", {
+				Name = "Bar" .. i,
+				AnchorPoint = Vector2.new(0.5, 0.5),
+				Position = UDim2.fromScale(0.5, i == 1 and 0.12 or 0.88),
+				Size = UDim2.fromScale(0.5, 0.085),
+				BackgroundColor3 = BLACK,
+				BackgroundTransparency = 0.5,
+				BorderSizePixel = 0,
+			}, lens)
+			make("UICorner", { CornerRadius = PILL }, bar)
+			make("UIGradient", { Transparency = STREAK, Rotation = 0 }, bar)
+		end
+	end
+
 	-- por fora da lente: franjas de dispersão e contorno luminoso finíssimo
 	self._fringeC = ring(body, "FringeC", 0, 1, Color3.fromRGB(80, 210, 255), FRINGE)
 	self._fringeM = ring(body, "FringeM", 0, 1, Color3.fromRGB(255, 90, 170), FRINGE)
 	self._outline = ring(body, "Outline", 0, 1, WHITE, OUTLINE)
+
+	-- pílula sólida de repouso: some quando o vidro "acende" (ver _update)
+	if cfg.solid then
+		local solid = make("Frame", {
+			Name = "Solid",
+			Size = UDim2.fromScale(1, 1),
+			BackgroundColor3 = options.solidColor or WHITE,
+			BorderSizePixel = 0,
+		}, body)
+		make("UICorner", { CornerRadius = PILL }, solid)
+		self._solid = solid
+		self._solidStroke = make("UIStroke", {
+			Color = BLACK,
+			Thickness = 1,
+			Transparency = 0.8,
+			ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+		}, solid)
+	end
 
 	self.Root = root
 	self._body = body
@@ -482,6 +526,11 @@ function Glass:_applyStatic()
 	local visible = cfg.dispersion > 0.02
 	self._fringeC.frame.Visible = visible
 	self._fringeM.frame.Visible = visible
+	if cfg.solid then
+		self._outline.frame.Visible = false -- reaparecem em _update quando o vidro acende
+		self._fringeC.frame.Visible = false
+		self._fringeM.frame.Visible = false
+	end
 	self._streak.BackgroundTransparency = 1 - 0.7 * r
 	self._glint.BackgroundTransparency = 1 - 0.55 * r
 	for _, shadow in self._shadows do
@@ -676,6 +725,18 @@ function Glass:_update(dt)
 	self._body.Size = UDim2.fromScale(wf, hf)
 	self._body.Position = UDim2.fromScale(0.5 + ox / size.X, 0.5 + oy / size.Y)
 	self._tint.BackgroundTransparency = math.min(1, cfg.transparency + 0.03 * pressNow)
+	if self._solid then
+		-- repouso = pílula branca; ao tocar a lente aparece e a pílula se dissolve
+		local f = clamp01(pressNow * 1.5)
+		self._lens.GroupTransparency = 1 - f
+		self._solid.BackgroundTransparency = clamp01(f * 1.3)
+		self._solidStroke.Transparency = lerp(0.8, 1, clamp01(f * 1.3))
+		local glassOn = f > 0.02
+		self._outline.frame.Visible = glassOn
+		local fringes = glassOn and cfg.dispersion > 0.02
+		self._fringeC.frame.Visible = fringes
+		self._fringeM.frame.Visible = fringes
+	end
 
 	-- direção da luz (suavizada pelas molas, reage ao ponteiro)
 	local Lx, Ly = light.x.x, light.y.x
@@ -753,7 +814,8 @@ end
 function LiquidGlass.Toggle(parent, options)
 	options = options or {}
 	local track = options.trackSize or Vector2.new(58, 28)
-	local knob = options.knobSize or Vector2.new(38, 32)
+	local knob = options.knobSize or Vector2.new(math.floor(track.X * 0.59), track.Y - 4)
+	local sideWarp = clamp01(options.sideWarp or 0.6)
 	local inset = options.inset or 2
 	local onColor = options.onColor or Color3.fromRGB(48, 209, 88)
 	local offColor = options.offColor or Color3.fromRGB(58, 58, 60)
@@ -771,6 +833,8 @@ function LiquidGlass.Toggle(parent, options)
 	}, parent)
 	local trackFrame = make("Frame", {
 		Name = "Track",
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.5, 0.5),
 		Size = UDim2.fromScale(1, 1),
 		BackgroundColor3 = offColor,
 		BorderSizePixel = 0,
@@ -784,6 +848,10 @@ function LiquidGlass.Toggle(parent, options)
 	glassOptions.size = knob
 	glassOptions.position = UDim2.fromScale(0, 0.5)
 	glassOptions.name = "Knob"
+	if glassOptions.solid == nil then glassOptions.solid = true end
+	if glassOptions.bars == nil then glassOptions.bars = true end
+	if options.pressScale == nil then glassOptions.pressScale = 1.44 end
+	if options.transparency == nil then glassOptions.transparency = 0.82 end
 	local glass = LiquidGlass.new(root, glassOptions)
 	local hit = newHit(root, 8, 10)
 
@@ -816,6 +884,9 @@ function LiquidGlass.Toggle(parent, options)
 		local p = spring.x
 		glass.Root.Position = UDim2.fromScale(knobX(p) / track.X, 0.5)
 		trackFrame.BackgroundColor3 = trackColor(p)
+		-- trilho ao lado deforma junto com o vidro: achata e alarga enquanto pressionado
+		local press = glass._press.x
+		trackFrame.Size = UDim2.fromScale(1 + 0.06 * sideWarp * press, 1 - 0.18 * sideWarp * press)
 	end
 	place()
 
@@ -835,7 +906,7 @@ function LiquidGlass.Toggle(parent, options)
 	end
 
 	function self:_update(dt)
-		if spring.x == spring.target and spring.v == 0 then
+		if spring.x == spring.target and spring.v == 0 and glass._press:settled(0.002) then
 			return -- em repouso: nada a escrever
 		end
 		spring:step(dt)
@@ -897,7 +968,8 @@ function LiquidGlass.Slider(parent, options)
 	options = options or {}
 	local length = options.length or 240
 	local railH = options.railHeight or 6
-	local thumb = options.thumbSize or Vector2.new(34, 34)
+	local thumb = options.thumbSize or Vector2.new(36, 24)
+	local sideWarp = clamp01(options.sideWarp or 0.6)
 	local minV, maxV = options.min or 0, options.max or 1
 	local stepV = options.step
 	local railColor = options.railColor or Color3.fromRGB(58, 58, 60)
@@ -938,6 +1010,10 @@ function LiquidGlass.Slider(parent, options)
 	glassOptions.size = thumb
 	glassOptions.position = UDim2.fromScale(0, 0.5)
 	glassOptions.name = "Thumb"
+	if glassOptions.solid == nil then glassOptions.solid = true end
+	if glassOptions.bars == nil then glassOptions.bars = true end
+	if options.pressScale == nil then glassOptions.pressScale = 1.4 end
+	if options.transparency == nil then glassOptions.transparency = 0.82 end
 	local glass = LiquidGlass.new(root, glassOptions)
 	local hit = newHit(root, 0, 0)
 
@@ -967,6 +1043,8 @@ function LiquidGlass.Slider(parent, options)
 		local x = thumbX(spring.x)
 		glass.Root.Position = UDim2.fromScale(x / length, 0.5)
 		fill.Size = UDim2.fromScale(x / length, 1)
+		-- o trilho engrossa enquanto o vidro é tocado (deformação do elemento ao lado)
+		rail.Size = UDim2.fromOffset(length, railH * (1 + 0.5 * sideWarp * glass._press.x))
 	end
 	place()
 
@@ -1001,7 +1079,7 @@ function LiquidGlass.Slider(parent, options)
 	end
 
 	function self:_update(dt)
-		if spring.x == spring.target and spring.v == 0 then
+		if spring.x == spring.target and spring.v == 0 and glass._press:settled(0.002) then
 			return -- em repouso: nada a escrever
 		end
 		spring:step(dt)
