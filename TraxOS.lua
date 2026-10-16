@@ -822,7 +822,7 @@ if LiquidGlass ~= nil then
 			glassOptions({
 				name = "GlassToggle",
 				trackSize = Vector2.new(SWITCH_W, SWITCH_H),
-				knobSize = Vector2.new(34, 30),
+				knobSize = Vector2.new(34, 24),
 				anchorPoint = Vector2.new(1, 0),
 				position = UDim2.fromOffset(W - PAD, Y_TOGGLE + (ROW_H - SWITCH_H) / 2),
 				value = CONFIG.defaultToggle,
@@ -866,7 +866,7 @@ if LiquidGlass ~= nil then
 			glassOptions({
 				name = "GlassSlider",
 				length = SLIDER_LEN,
-				thumbSize = Vector2.new(SLIDER_THUMB + 6, SLIDER_THUMB),
+				thumbSize = Vector2.new(SLIDER_THUMB + 6, SLIDER_THUMB - 6),
 				anchorPoint = Vector2.new(1, 0.5),
 				position = UDim2.fromOffset(W - PAD, Y_SLIDER + ROW_H / 2),
 				value = clamp01(CONFIG.defaultSlider),
