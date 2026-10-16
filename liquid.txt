@@ -24,6 +24,8 @@
 	  shadow       bool   sombra suave
 	  layers       0..4   anéis da lente de refração (0 desliga)
 	  tint         Color3 cor do corpo
+	  inner        Vector2 tamanho (fração X, Y) do miolo da lente quando layers = 2
+	  specular     0..1   intensidade do reflexo especular e do brilho pontual
 	  edge         0..1   aro escuro de compressão (0 = vidro limpo, sem sombra interna)
 	  glow         0..1   halo luminoso suave em volta do vidro (segue a luz)
 	  solid        bool   repouso em pílula branca opaca; o vidro só aparece ao tocar/arrastar
@@ -146,6 +148,8 @@ LiquidGlass.defaults = {
 	bars = false,
 	edge = 1,
 	glow = 0,
+	inner = Vector2.new(0.62, 0.74),
+	specular = 1,
 }
 
 function LiquidGlass.configure(partial)
@@ -538,8 +542,9 @@ function Glass:_applyStatic()
 		self._fringeC.frame.Visible = false
 		self._fringeM.frame.Visible = false
 	end
-	self._streak.BackgroundTransparency = 1 - 0.7 * r
-	self._glint.BackgroundTransparency = 1 - 0.55 * r
+	local spec = clamp01(cfg.specular)
+	self._streak.BackgroundTransparency = 1 - 0.7 * r * spec
+	self._glint.BackgroundTransparency = 1 - 0.55 * r * spec
 	for _, shadow in self._shadows do
 		shadow.Visible = cfg.shadow
 	end
@@ -599,16 +604,22 @@ function Glass:SetBackdrop(provider)
 		local layers = {}
 		for k, fraction in fractions do
 			local nextFraction = fractions[k + 1] or 0
+			-- com 2 camadas o miolo pode ser mais largo que alto (como a lente do iOS)
+			local fx, fy = fraction, fraction
+			if count == 2 and k == 2 and self.cfg.inner then
+				fx, fy = self.cfg.inner.X, self.cfg.inner.Y
+				fraction = (fx + fy) / 2
+			end
 			local group = make("CanvasGroup", {
 				Name = "Layer" .. k,
 				AnchorPoint = Vector2.new(0.5, 0.5),
 				Position = UDim2.fromScale(0.5, 0.5),
-				Size = UDim2.fromScale(fraction, fraction),
+				Size = UDim2.fromScale(fx, fy),
 				BackgroundTransparency = 1,
 				BorderSizePixel = 0,
 			}, self._layerHolder)
 			make("UICorner", { CornerRadius = PILL }, group)
-			layers[k] = { group = group, fraction = fraction, rho = (fraction + nextFraction) / 2, pool = {} }
+			layers[k] = { group = group, fx = fx, fy = fy, rho = (fraction + nextFraction) / 2, pool = {} }
 		end
 		self._layers = layers
 	end
@@ -658,7 +669,7 @@ function Glass:_updateLayers(ox, oy, bw, bh, press, Lx, Ly, leanX, leanY)
 		local depth = 0.6 + 0.4 * (k / count)
 		local shiftX = (-Lx * 1.4 * d - leanX * 2.5 * d) * depth
 		local shiftY = (-Ly * 1.4 * d - leanY * 2.5 * d) * depth
-		local lw, lh = bw * layer.fraction, bh * layer.fraction
+		local lw, lh = bw * layer.fx, bh * layer.fy
 		local group = layer.group
 		group.BackgroundColor3 = data.base or BLACK
 		group.BackgroundTransparency = data.baseTransparency or 0
@@ -810,13 +821,15 @@ end
 -- aparência padrão dos componentes: pílula transparente e limpa, com brilho suave
 local function applyCleanDefaults(glassOptions, options, pressScale)
 	local defaults = {
-		transparency = 0.88,
-		distortion = 0.3,
-		dispersion = 0,
-		layers = 1,
-		edge = 0.1,
-		glow = 0.8,
-		reflection = 0.9,
+		transparency = 0.8, -- véu claro: o fundo continua visível
+		distortion = 0.75, -- miolo ampliado, borda comprimida (é o que "entorta" o redor)
+		dispersion = 0, -- sem franjas de cor
+		layers = 2, -- miolo + anel de compressão, como no iOS
+		inner = Vector2.new(0.6, 0.74),
+		edge = 0, -- sem sombra escura interna
+		glow = 0.3,
+		reflection = 0.6,
+		specular = 0.2,
 		pressScale = pressScale,
 	}
 	for key, value in defaults do
@@ -843,7 +856,7 @@ function LiquidGlass.Toggle(parent, options)
 	options = options or {}
 	local track = options.trackSize or Vector2.new(58, 28)
 	local knob = options.knobSize or Vector2.new(math.floor(track.X * 0.59), track.Y - 4)
-	local sideWarp = clamp01(options.sideWarp or 0.6)
+	local sideWarp = clamp01(options.sideWarp or 0.35)
 	local inset = options.inset or 2
 	local onColor = options.onColor or Color3.fromRGB(48, 209, 88)
 	local offColor = options.offColor or Color3.fromRGB(58, 58, 60)
@@ -876,7 +889,7 @@ function LiquidGlass.Toggle(parent, options)
 	glassOptions.size = knob
 	glassOptions.position = UDim2.fromScale(0, 0.5)
 	glassOptions.name = "Knob"
-	applyCleanDefaults(glassOptions, options, 1.25)
+	applyCleanDefaults(glassOptions, options, 1.4)
 	local glass = LiquidGlass.new(root, glassOptions)
 	local hit = newHit(root, 8, 10)
 
@@ -994,7 +1007,7 @@ function LiquidGlass.Slider(parent, options)
 	local length = options.length or 240
 	local railH = options.railHeight or 6
 	local thumb = options.thumbSize or Vector2.new(36, 24)
-	local sideWarp = clamp01(options.sideWarp or 0.6)
+	local sideWarp = clamp01(options.sideWarp or 0.35)
 	local minV, maxV = options.min or 0, options.max or 1
 	local stepV = options.step
 	local railColor = options.railColor or Color3.fromRGB(58, 58, 60)
@@ -1035,7 +1048,7 @@ function LiquidGlass.Slider(parent, options)
 	glassOptions.size = thumb
 	glassOptions.position = UDim2.fromScale(0, 0.5)
 	glassOptions.name = "Thumb"
-	applyCleanDefaults(glassOptions, options, 1.25)
+	applyCleanDefaults(glassOptions, options, 1.3)
 	local glass = LiquidGlass.new(root, glassOptions)
 	local hit = newHit(root, 0, 0)
 
