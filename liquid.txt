@@ -426,10 +426,10 @@ function LiquidGlass.new(parent, options)
 		BackgroundTransparency = cfg.transparency,
 		BorderSizePixel = 0,
 	}, lens)
-	make("UIGradient", { Rotation = 90, Transparency = seq({ 0, 0 }, { 1, 0.4 }) }, tint)
+	make("UIGradient", { Rotation = 90, Transparency = seq({ 0, 0 }, { 1, 0.12 }) }, tint) -- véu quase uniforme
 
 	self._edge = ring(lens, "Edge", 4, 4, BLACK, EDGE)
-	self._rimB = ring(lens, "RimB", 3, 3, Color3.fromRGB(170, 215, 255), RIM_B)
+	self._rimB = ring(lens, "RimB", 3, 3, Color3.fromRGB(235, 240, 250), RIM_B)
 	self._rimA = ring(lens, "RimA", 2, 1.5, WHITE, RIM_A)
 
 	local streak = make("Frame", {
@@ -539,6 +539,7 @@ function Glass:_applyStatic()
 	self._fringeM.frame.Visible = visible
 	if cfg.solid then
 		self._outline.frame.Visible = false -- reaparecem em _update quando o vidro acende
+		self._glow.frame.Visible = false
 		self._fringeC.frame.Visible = false
 		self._fringeM.frame.Visible = false
 	end
@@ -751,6 +752,7 @@ function Glass:_update(dt)
 		self._solidStroke.Transparency = lerp(0.8, 1, clamp01(f * 1.3))
 		local glassOn = f > 0.02
 		self._outline.frame.Visible = glassOn
+		self._glow.frame.Visible = glassOn and cfg.glow > 0.02
 		local fringes = glassOn and cfg.dispersion > 0.02
 		self._fringeC.frame.Visible = fringes
 		self._fringeM.frame.Visible = fringes
@@ -821,16 +823,17 @@ end
 -- aparência padrão dos componentes: pílula transparente e limpa, com brilho suave
 local function applyCleanDefaults(glassOptions, options, pressScale)
 	local defaults = {
-		transparency = 0.8, -- véu claro: o fundo continua visível
+		transparency = 0.7, -- véu branco: o fundo continua visível
 		distortion = 0.75, -- miolo ampliado, borda comprimida (é o que "entorta" o redor)
 		dispersion = 0, -- sem franjas de cor
 		layers = 2, -- miolo + anel de compressão, como no iOS
 		inner = Vector2.new(0.6, 0.74),
 		edge = 0, -- sem sombra escura interna
-		glow = 0.3,
-		reflection = 0.6,
-		specular = 0.2,
+		glow = 0, -- sem halo: visual limpo
+		reflection = 0.8, -- contorno fino e claro
+		specular = 0, -- sem reflexo pontual
 		pressScale = pressScale,
+		solid = true, -- repouso branco opaco; a lente aparece ao tocar/arrastar (iOS 26)
 	}
 	for key, value in defaults do
 		if options[key] == nil then
