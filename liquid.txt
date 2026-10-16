@@ -1,0 +1,1286 @@
+--!nonstrict
+--[[
+	LiquidGlass — vidro líquido para UI do Roblox (Luau, sem dependências)
+	ModuleScript. Uso: local LiquidGlass = require(caminho.do.ModuleScript)
+
+	API
+	  LiquidGlass.new(parent, options)      -> glass   (qualquer vidro: Root, Body, métodos abaixo)
+	  LiquidGlass.Toggle(parent, options)   -> toggle  (:Set / :Get / :Destroy, .Frame, .Glass)
+	  LiquidGlass.Slider(parent, options)   -> slider  (:Set / :Get / :Destroy, .Frame, .Glass)
+	  LiquidGlass.Orb(parent, options)      -> orb     (gota arrastável com mola)
+	  LiquidGlass.Link(orbA, orbB, options) -> link    (atração, fusão e desprendimento)
+	  LiquidGlass.Spring                    -> mola amortecida reutilizável
+	  LiquidGlass.defaults / LiquidGlass.configure({...})
+
+	Configuração (em options de qualquer componente, ou em defaults)
+	  distortion   0..1   força da lente (ampliação no centro, compressão nas bordas)
+	  elasticity   0..1   0 = seco, 1 = gelatina (menos amortecimento, mais oscilação)
+	  reflection   0..1   brilho dos reflexos e contornos
+	  transparency 0..1   transparência do corpo (1 = totalmente claro)
+	  speed        0.25+  multiplica a frequência de todas as molas
+	  dispersion   0..1   franjas de cor (cianos/magenta) nas bordas
+	  stretch      0..1   quanto o vidro estica na direção do movimento
+	  pressScale          escala ao tocar (o vidro "infla")
+	  shadow       bool   sombra suave
+	  layers       0..4   anéis da lente de refração (0 desliga)
+	  tint         Color3 cor do corpo
+
+	LIMITAÇÃO REAL DO ROBLOX (e o que este módulo faz no lugar)
+	  Uma UI não consegue ler o que já foi desenhado atrás dela: não há shader de
+	  UI nem backdrop-filter. EditableImage só ESCREVE pixels (não captura a tela)
+	  e BlurEffect/DepthOfField agem no mundo 3D inteiro, nunca por elemento.
+	  Logo, refração VERDADEIRA de um fundo qualquer não existe. A simulação:
+	    1) Lente real sobre conteúdo CONHECIDO: você descreve as formas que estão
+	       atrás do vidro (trilho, track, listras...) com glass:SetBackdrop(fn) e
+	       elas são redesenhadas dentro do vidro em anéis concêntricos, ampliadas
+	       no centro e comprimidas/deslocadas nas bordas (lente convexa).
+	    2) Camadas ópticas por cima: aro escuro de compressão, brilho de borda
+	       (fresnel), reflexo especular que segue o ponteiro, franjas de dispersão,
+	       contorno finíssimo e sombra suave.
+	    3) Sem fundo conhecido (mundo 3D), só as camadas ópticas aparecem.
+]]
+
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local GuiService = game:GetService("GuiService")
+
+local LiquidGlass = {}
+
+local PILL = UDim.new(1, 0)
+local TAU = math.pi * 2
+local BLACK = Color3.new(0, 0, 0)
+local WHITE = Color3.new(1, 1, 1)
+local DEFAULT_LIGHT = Vector2.new(-0.55, -0.83) -- de onde vem a luz (cima-esquerda)
+
+---------------------------------------------------------------- utilidades
+local function clamp01(x)
+	return math.clamp(x, 0, 1)
+end
+
+local function lerp(a, b, t)
+	return a + (b - a) * t
+end
+
+-- diferença de ângulo pelo caminho mais curto, em graus (-180..180)
+local function angleDiff(from, to)
+	return (to - from + 540) % 360 - 180
+end
+
+local function make(class, props, parent)
+	local inst = Instance.new(class)
+	for key, value in props do
+		inst[key] = value
+	end
+	inst.Parent = parent
+	return inst
+end
+
+-- seq({0, 1}, {0.5, 0}, {1, 1}) -> NumberSequence
+local function seq(...)
+	local keys = {}
+	for _, point in { ... } do
+		table.insert(keys, NumberSequenceKeypoint.new(point[1], point[2]))
+	end
+	return NumberSequence.new(keys)
+end
+
+---------------------------------------------------------------- mola amortecida
+-- frequência em Hz, amortecimento ζ (1 = crítico, <1 oscila). Integração
+-- semi-implícita em sub-passos de 1/120 s: estável mesmo com quedas de FPS.
+local Spring = {}
+Spring.__index = Spring
+
+function Spring.new(value, frequency, damping)
+	return setmetatable({ x = value, v = 0, target = value, w = frequency * TAU, z = damping }, Spring)
+end
+
+function Spring:tune(frequency, damping)
+	self.w = frequency * TAU
+	self.z = damping
+end
+
+function Spring:step(dt)
+	local steps = math.max(1, math.ceil(dt * 120))
+	local h = dt / steps
+	local w, z = self.w, self.z
+	local x, v, target = self.x, self.v, self.target
+	for _ = 1, steps do
+		v = v + (w * w * (target - x) - 2 * z * w * v) * h
+		x = x + v * h
+	end
+	self.x, self.v = x, v
+	return x
+end
+
+function Spring:settled(epsilon)
+	epsilon = epsilon or 0.002
+	return math.abs(self.x - self.target) < epsilon and math.abs(self.v) < epsilon * 4
+end
+
+function Spring:snap(value)
+	self.x, self.v, self.target = value, 0, value
+end
+
+LiquidGlass.Spring = Spring
+
+---------------------------------------------------------------- configuração
+LiquidGlass.defaults = {
+	distortion = 0.6,
+	elasticity = 0.6,
+	reflection = 0.7,
+	transparency = 0.93,
+	speed = 1,
+	dispersion = 0.5,
+	stretch = 0.6,
+	pressScale = 1.12,
+	shadow = true,
+	layers = 3,
+	tint = WHITE,
+}
+
+function LiquidGlass.configure(partial)
+	for key, value in partial do
+		LiquidGlass.defaults[key] = value
+	end
+end
+
+local function resolveConfig(options)
+	local cfg = {}
+	for key, value in LiquidGlass.defaults do
+		cfg[key] = value
+		if options and options[key] ~= nil then
+			cfg[key] = options[key]
+		end
+	end
+	return cfg
+end
+
+local function dampingFor(cfg)
+	return 0.95 - 0.7 * clamp01(cfg.elasticity)
+end
+
+---------------------------------------------------------------- laço global
+-- Um único RenderStepped para tudo; dorme sozinho quando não há objetos.
+local objects = {}
+local loopConnections = nil
+local pointer = nil -- posição do ponteiro (mesmo espaço de input.Position)
+
+local function startLoop()
+	if loopConnections then
+		return
+	end
+	local conns = {}
+	loopConnections = conns
+	table.insert(
+		conns,
+		RunService.RenderStepped:Connect(function(dt)
+			dt = math.min(dt, 1 / 20) -- um travamento não pode explodir as molas
+			local i = 1
+			while i <= #objects do
+				local object = objects[i]
+				if object._dead then
+					table.remove(objects, i)
+				else
+					object:_update(dt)
+					i = i + 1
+				end
+			end
+			if #objects == 0 then
+				for _, conn in conns do
+					conn:Disconnect()
+				end
+				loopConnections = nil
+			end
+		end)
+	)
+	table.insert(
+		conns,
+		UserInputService.InputChanged:Connect(function(input)
+			local kind = input.UserInputType
+			if kind == Enum.UserInputType.MouseMovement or kind == Enum.UserInputType.Touch then
+				pointer = Vector2.new(input.Position.X, input.Position.Y)
+			end
+		end)
+	)
+	table.insert(
+		conns,
+		UserInputService.InputBegan:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.Touch then
+				pointer = Vector2.new(input.Position.X, input.Position.Y)
+			end
+		end)
+	)
+	table.insert(
+		conns,
+		UserInputService.InputEnded:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.Touch then
+				pointer = nil -- dedo saiu: a luz volta ao padrão
+			end
+		end)
+	)
+end
+
+-- priority menor atualiza primeiro (componentes antes do vidro: sem 1 quadro de atraso)
+local function register(object, priority)
+	object.priority = priority
+	local index = #objects + 1
+	for i, other in objects do
+		if other.priority > priority then
+			index = i
+			break
+		end
+	end
+	table.insert(objects, index, object)
+	startLoop()
+end
+
+-- arrasto por Mouse e Toque. Devolve as conexões para limpar no Destroy.
+local function bindDrag(hit, onBegin, onMove, onEnd)
+	local active, token = false, nil
+	local conns = {}
+	table.insert(
+		conns,
+		hit.InputBegan:Connect(function(input)
+			local kind = input.UserInputType
+			if active or not (kind == Enum.UserInputType.MouseButton1 or kind == Enum.UserInputType.Touch) then
+				return
+			end
+			active, token = true, input
+			onBegin(input)
+		end)
+	)
+	table.insert(
+		conns,
+		UserInputService.InputChanged:Connect(function(input)
+			if not active then
+				return
+			end
+			local kind = input.UserInputType
+			if kind == Enum.UserInputType.MouseMovement or (kind == Enum.UserInputType.Touch and input == token) then
+				onMove(input)
+			end
+		end)
+	)
+	table.insert(
+		conns,
+		UserInputService.InputEnded:Connect(function(input)
+			if not active then
+				return
+			end
+			local isMouse = input.UserInputType == Enum.UserInputType.MouseButton1
+				and token.UserInputType == Enum.UserInputType.MouseButton1
+			if input == token or isMouse then
+				active, token = false, nil
+				onEnd(input)
+			end
+		end)
+	)
+	return conns
+end
+
+---------------------------------------------------------------- vidro
+local Glass = {}
+Glass.__index = Glass
+
+-- anel só com contorno. O UIStroke de Border fica por fora do frame, então o
+-- frame é recuado em `inset` para o traço cair rente à borda da lente.
+local function ring(parent, name, inset, thickness, color, gradient)
+	local frame = make("Frame", {
+		Name = name,
+		Position = UDim2.fromOffset(inset, inset),
+		Size = UDim2.new(1, -inset * 2, 1, -inset * 2),
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+	}, parent)
+	make("UICorner", { CornerRadius = PILL }, frame)
+	local stroke = make("UIStroke", {
+		Color = color,
+		Thickness = thickness,
+		Transparency = 0.5,
+		ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+	}, frame)
+	local grad = make("UIGradient", { Transparency = gradient, Rotation = 0 }, stroke)
+	return { frame = frame, stroke = stroke, gradient = grad }
+end
+
+local RIM_A = seq({ 0, 0.05 }, { 0.2, 0.45 }, { 0.5, 1 }, { 0.8, 0.72 }, { 1, 0.4 })
+local RIM_B = seq({ 0, 1 }, { 0.5, 1 }, { 0.8, 0.45 }, { 1, 0.05 })
+local EDGE = seq({ 0, 1 }, { 0.4, 1 }, { 0.75, 0.5 }, { 1, 0.25 })
+local OUTLINE = seq({ 0, 0.1 }, { 0.25, 0.5 }, { 0.5, 0.9 }, { 0.8, 0.6 }, { 1, 0.3 })
+local FRINGE = seq({ 0, 0.3 }, { 0.3, 0.7 }, { 0.5, 1 }, { 0.7, 0.7 }, { 1, 0.3 })
+local STREAK = seq({ 0, 1 }, { 0.5, 0 }, { 1, 1 })
+local LAYER_FRACTIONS = {
+	{ 1 },
+	{ 1, 0.62 },
+	{ 1, 0.76, 0.46 },
+	{ 1, 0.84, 0.64, 0.4 },
+}
+
+function LiquidGlass.new(parent, options)
+	options = options or {}
+	local cfg = resolveConfig(options)
+	local size = options.size or Vector2.new(56, 56)
+	local self = setmetatable({}, Glass)
+
+	self.cfg = cfg
+	self.size = size
+	self._dead = false
+	self._wake = 1
+	self._motion = Vector2.new(0, 0)
+	self._pull = Vector2.new(0, 0)
+	self._pressed = false
+	self._merge = 0
+	self._mergeDir = Vector2.new(1, 0)
+	self._appliedMerge = -1
+	self._insetFix = nil
+	self._provider = nil
+	self._layers = nil
+	self._lean = { x = Spring.new(0, 4.6, 0.4), y = Spring.new(0, 4.6, 0.4) }
+	self._press = Spring.new(0, 6.5, 0.55)
+	self._light = {
+		x = Spring.new(DEFAULT_LIGHT.X, 3.2, 0.85),
+		y = Spring.new(DEFAULT_LIGHT.Y, 3.2, 0.85),
+	}
+
+	local root = make("Frame", {
+		Name = options.name or "LiquidGlass",
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = options.position or UDim2.fromScale(0.5, 0.5),
+		Size = UDim2.fromOffset(size.X, size.Y),
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		ZIndex = options.zIndex or 1,
+	}, parent)
+	-- Body é o que estica/achata/desloca; tudo dentro dele usa ESCALA
+	local body = make("Frame", {
+		Name = "Body",
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.5, 0.5),
+		Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+	}, root)
+
+	-- sombra suave: anéis só de contorno, mais fortes embaixo (não escurecem o miolo)
+	local shadows = {}
+	for i, spec in { { 6, 0.9 }, { 12, 0.955 } } do
+		local frame = make("Frame", {
+			Name = "Shadow" .. i,
+			AnchorPoint = Vector2.new(0.5, 0.5),
+			Position = UDim2.new(0.5, 0, 0.5, 3 + i),
+			Size = UDim2.fromScale(1, 1),
+			BackgroundTransparency = 1,
+			BorderSizePixel = 0,
+			Visible = cfg.shadow,
+		}, body)
+		make("UICorner", { CornerRadius = PILL }, frame)
+		local stroke = make("UIStroke", {
+			Color = BLACK,
+			Thickness = spec[1],
+			Transparency = spec[2],
+			ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+		}, frame)
+		make("UIGradient", { Rotation = 90, Transparency = seq({ 0, 1 }, { 0.35, 1 }, { 1, 0.05 }) }, stroke)
+		table.insert(shadows, frame)
+	end
+
+	-- a lente recorta tudo no formato do vidro (CanvasGroup respeita o UICorner)
+	local lens = make("CanvasGroup", {
+		Name = "Lens",
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.5, 0.5),
+		Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+	}, body)
+	make("UICorner", { CornerRadius = PILL }, lens)
+
+	local layerHolder = make("Frame", {
+		Name = "Layers",
+		Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+	}, lens)
+	local tint = make("Frame", {
+		Name = "Tint",
+		Size = UDim2.fromScale(1, 1),
+		BackgroundColor3 = cfg.tint,
+		BackgroundTransparency = cfg.transparency,
+		BorderSizePixel = 0,
+	}, lens)
+	make("UIGradient", { Rotation = 90, Transparency = seq({ 0, 0 }, { 1, 0.4 }) }, tint)
+
+	self._edge = ring(lens, "Edge", 4, 4, BLACK, EDGE)
+	self._rimB = ring(lens, "RimB", 3, 3, Color3.fromRGB(170, 215, 255), RIM_B)
+	self._rimA = ring(lens, "RimA", 2, 1.5, WHITE, RIM_A)
+
+	local streak = make("Frame", {
+		Name = "Streak",
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.3, 0.2),
+		Size = UDim2.fromScale(0.5, 0.16),
+		BackgroundColor3 = WHITE,
+		BorderSizePixel = 0,
+	}, lens)
+	make("UICorner", { CornerRadius = PILL }, streak)
+	make("UIGradient", { Transparency = STREAK, Rotation = 0 }, streak)
+	local dot = make("Frame", {
+		Name = "Glint",
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.7, 0.8),
+		Size = UDim2.fromScale(0.11, 0.11),
+		BackgroundColor3 = WHITE,
+		BorderSizePixel = 0,
+	}, lens)
+	make("UICorner", { CornerRadius = PILL }, dot)
+
+	-- por fora da lente: franjas de dispersão e contorno luminoso finíssimo
+	self._fringeC = ring(body, "FringeC", 0, 1, Color3.fromRGB(80, 210, 255), FRINGE)
+	self._fringeM = ring(body, "FringeM", 0, 1, Color3.fromRGB(255, 90, 170), FRINGE)
+	self._outline = ring(body, "Outline", 0, 1, WHITE, OUTLINE)
+
+	self.Root = root
+	self._body = body
+	self._lens = lens
+	self._layerHolder = layerHolder
+	self._tint = tint
+	self._streak = streak
+	self._glint = dot
+	self._shadows = shadows
+
+	self:_tune()
+	self:_applyStatic()
+	register(self, 1)
+	return self
+end
+
+function Glass:_tune()
+	local cfg = self.cfg
+	local z = dampingFor(cfg)
+	local f = cfg.speed
+	self._lean.x:tune(4.6 * f, z)
+	self._lean.y:tune(4.6 * f, z)
+	self._press:tune(6.5 * f, math.min(1, z + 0.12))
+	self._light.x:tune(3.2 * f, 0.85)
+	self._light.y:tune(3.2 * f, 0.85)
+end
+
+-- propriedades que só dependem da configuração (não mudam a cada quadro)
+function Glass:_applyStatic()
+	local cfg = self.cfg
+	local r = clamp01(cfg.reflection)
+	local d = clamp01(cfg.distortion)
+	self._tint.BackgroundColor3 = cfg.tint
+	self._tint.BackgroundTransparency = cfg.transparency
+	self._baseTransparency = {
+		rimA = 1 - 0.9 * r,
+		rimB = 1 - 0.55 * r,
+		edge = 1 - 0.22 * (0.4 + 0.6 * d),
+		outline = 1 - 0.6 * r,
+		fringe = 0.8 - 0.25 * clamp01(cfg.dispersion),
+	}
+	local visible = cfg.dispersion > 0.02
+	self._fringeC.frame.Visible = visible
+	self._fringeM.frame.Visible = visible
+	self._streak.BackgroundTransparency = 1 - 0.7 * r
+	self._glint.BackgroundTransparency = 1 - 0.55 * r
+	for _, shadow in self._shadows do
+		shadow.Visible = cfg.shadow
+	end
+	self._appliedMerge = -1 -- força reaplicar as transparências dos anéis
+end
+
+function Glass:SetConfig(partial)
+	for key, value in partial do
+		self.cfg[key] = value
+	end
+	self:_tune()
+	self:_applyStatic()
+	self:Invalidate()
+end
+
+function Glass:Invalidate()
+	self._wake = 0.6
+end
+
+function Glass:SetMotion(vx, vy)
+	self._motion = Vector2.new(vx, vy)
+	self._wake = 0.6
+end
+
+function Glass:SetPressed(pressed)
+	self._pressed = pressed
+	self._wake = 0.6
+end
+
+-- empurrão instantâneo na inclinação (ex.: impacto ao chegar no fim do curso)
+function Glass:Impulse(ix, iy)
+	self._lean.x.v = self._lean.x.v + ix
+	self._lean.y.v = self._lean.y.v + iy
+	self._wake = 0.6
+end
+
+-- atração: o vidro se estica na direção (dx, dy) com força `amount`
+function Glass:Pull(dx, dy, amount)
+	self._pull = Vector2.new(dx * amount, dy * amount)
+	self._wake = 0.6
+end
+
+-- fusão com outro vidro: o aro do lado do parceiro some (m 0..1)
+function Glass:SetMerge(dx, dy, m)
+	self._merge = m
+	self._mergeDir = Vector2.new(dx, dy)
+	self._wake = 0.6
+end
+
+-- provider(ox, oy) -> { base = Color3, baseTransparency = n, shapes = { {x,y,w,h,color,transparency,radius} } }
+-- coordenadas em px relativas ao CENTRO do Root (ox, oy = deslocamento do corpo)
+function Glass:SetBackdrop(provider)
+	self._provider = provider
+	local count = math.clamp(math.floor(self.cfg.layers), 0, 4)
+	if provider and count > 0 and not self._layers then
+		local fractions = LAYER_FRACTIONS[count]
+		local layers = {}
+		for k, fraction in fractions do
+			local nextFraction = fractions[k + 1] or 0
+			local group = make("CanvasGroup", {
+				Name = "Layer" .. k,
+				AnchorPoint = Vector2.new(0.5, 0.5),
+				Position = UDim2.fromScale(0.5, 0.5),
+				Size = UDim2.fromScale(fraction, fraction),
+				BackgroundTransparency = 1,
+				BorderSizePixel = 0,
+			}, self._layerHolder)
+			make("UICorner", { CornerRadius = PILL }, group)
+			layers[k] = { group = group, fraction = fraction, rho = (fraction + nextFraction) / 2, pool = {} }
+		end
+		self._layers = layers
+	end
+	if self._layers then
+		self._layerHolder.Visible = provider ~= nil
+	end
+	self:Invalidate()
+end
+
+function Glass:_lightTarget()
+	local p = pointer
+	if p then
+		if self._insetFix == nil then
+			local gui = self.Root:FindFirstAncestorWhichIsA("ScreenGui")
+			self._insetFix = (gui and gui.IgnoreGuiInset) and GuiService:GetGuiInset() or Vector2.new(0, 0)
+		end
+		local center = self.Root.AbsolutePosition + self.Root.AbsoluteSize * 0.5
+		local rel = p + self._insetFix - center
+		local dist = rel.Magnitude
+		if dist > 1 then
+			local influence = clamp01(1 - dist / 360) * 0.65
+			return lerp(DEFAULT_LIGHT.X, rel.X / dist, influence), lerp(DEFAULT_LIGHT.Y, rel.Y / dist, influence)
+		end
+	end
+	return DEFAULT_LIGHT.X, DEFAULT_LIGHT.Y
+end
+
+local function shapeFrame(group)
+	local frame = make("Frame", { BorderSizePixel = 0 }, group)
+	local corner = make("UICorner", { CornerRadius = PILL }, frame)
+	return { frame = frame, corner = corner }
+end
+
+function Glass:_updateLayers(ox, oy, bw, bh, press, Lx, Ly, leanX, leanY)
+	local data = self._provider(ox, oy)
+	if not data then
+		return
+	end
+	local layers = self._layers
+	local count = #layers
+	local d = self.cfg.distortion * (1 + 0.25 * press)
+	local shapes = data.shapes
+	for k = 1, count do
+		local layer = layers[k]
+		-- lente convexa: amplia no centro (rho→0), comprime na borda (rho→1)
+		local m = 1 + d * (0.3 - 0.9 * layer.rho * layer.rho)
+		local depth = 0.6 + 0.4 * (k / count)
+		local shiftX = (-Lx * 1.4 * d - leanX * 2.5 * d) * depth
+		local shiftY = (-Ly * 1.4 * d - leanY * 2.5 * d) * depth
+		local lw, lh = bw * layer.fraction, bh * layer.fraction
+		local group = layer.group
+		group.BackgroundColor3 = data.base or BLACK
+		group.BackgroundTransparency = data.baseTransparency or 0
+		local pool = layer.pool
+		for i = 1, #shapes do
+			local shape = shapes[i]
+			local entry = pool[i]
+			if not entry then
+				entry = shapeFrame(group)
+				pool[i] = entry
+			end
+			local w, h = shape.w * m, shape.h * m
+			local frame = entry.frame
+			frame.Visible = true
+			frame.AnchorPoint = Vector2.new(0.5, 0.5)
+			frame.Position = UDim2.fromScale(0.5 + ((shape.x - ox) * m + shiftX) / lw, 0.5 + ((shape.y - oy) * m + shiftY) / lh)
+			frame.Size = UDim2.fromScale(w / lw, h / lh)
+			frame.BackgroundColor3 = shape.color
+			frame.BackgroundTransparency = shape.transparency or 0
+			if shape.radius then
+				entry.corner.CornerRadius = UDim.new(math.min(0.5, shape.radius * m / math.max(math.min(w, h), 1)), 0)
+			else
+				entry.corner.CornerRadius = PILL
+			end
+		end
+		for i = #shapes + 1, #pool do
+			pool[i].frame.Visible = false
+		end
+	end
+end
+
+function Glass:_update(dt)
+	local cfg = self.cfg
+	local size = self.size
+	self._wake = self._wake - dt
+
+	local lean, press, light = self._lean, self._press, self._light
+	local targetX, targetY = self:_lightTarget()
+	light.x.target, light.y.target = targetX, targetY
+	lean.x.target = math.clamp(self._motion.X / 520 + self._pull.X, -1.2, 1.2)
+	lean.y.target = math.clamp(self._motion.Y / 520 + self._pull.Y, -1.2, 1.2)
+	press.target = self._pressed and 1 or 0
+
+	lean.x:step(dt)
+	lean.y:step(dt)
+	press:step(dt)
+	light.x:step(dt)
+	light.y:step(dt)
+
+	local resting = lean.x:settled(0.004)
+		and lean.y:settled(0.004)
+		and press:settled(0.004)
+		and light.x:settled(0.004)
+		and light.y:settled(0.004)
+	if resting and self._wake <= 0 then
+		return -- dormindo: nada a escrever nas propriedades
+	end
+
+	-- esticar na direção do movimento mantendo o volume; o lado de trás fica fixo
+	local k = 0.55 * cfg.stretch
+	local leanX = math.clamp(lean.x.x, -1.4, 1.4)
+	local leanY = math.clamp(lean.y.x, -1.4, 1.4)
+	local gx, gy = k * math.abs(leanX), k * math.abs(leanY)
+	local pressNow = press.x
+	local pressFactor = 1 + (cfg.pressScale - 1) * pressNow
+	local wf = (1 + gx) / math.sqrt(1 + gy) * pressFactor
+	local hf = (1 + gy) / math.sqrt(1 + gx) * pressFactor
+	local ox = leanX * k * 0.5 * size.X
+	local oy = leanY * k * 0.5 * size.Y
+	local bw, bh = size.X * wf, size.Y * hf
+	self._body.Size = UDim2.fromScale(wf, hf)
+	self._body.Position = UDim2.fromScale(0.5 + ox / size.X, 0.5 + oy / size.Y)
+	self._tint.BackgroundTransparency = math.min(1, cfg.transparency + 0.03 * pressNow)
+
+	-- direção da luz (suavizada pelas molas, reage ao ponteiro)
+	local Lx, Ly = light.x.x, light.y.x
+	local n = math.sqrt(Lx * Lx + Ly * Ly)
+	if n < 0.001 then
+		Lx, Ly, n = DEFAULT_LIGHT.X, DEFAULT_LIGHT.Y, 1
+	end
+	Lx, Ly = Lx / n, Ly / n
+	local angle = math.deg(math.atan2(-Ly, -Lx)) -- o polo t=0 do gradiente aponta para a luz
+
+	-- fusão: aros do lado do parceiro somem; contorno gira para o parceiro
+	local merge = self._merge
+	if merge ~= self._appliedMerge then
+		self._appliedMerge = merge
+		local fade = 1 - 0.85 * merge
+		local base = self._baseTransparency
+		self._rimA.stroke.Transparency = 1 - (1 - base.rimA) * fade
+		self._rimB.stroke.Transparency = 1 - (1 - base.rimB) * fade
+		self._edge.stroke.Transparency = 1 - (1 - base.edge) * fade
+		self._outline.stroke.Transparency = base.outline
+		self._fringeC.stroke.Transparency = base.fringe
+		self._fringeM.stroke.Transparency = base.fringe
+		self._outline.gradient.Transparency =
+			seq({ 0, 0.1 }, { 0.5, 0.55 }, { 0.8, lerp(0.6, 1, merge) }, { 1, lerp(0.3, 1, merge) })
+	end
+	local outlineAngle = angle
+	if merge > 0.01 then
+		local partner = math.deg(math.atan2(self._mergeDir.Y, self._mergeDir.X))
+		outlineAngle = angle + angleDiff(angle, partner) * merge
+	end
+	self._rimA.gradient.Rotation = angle
+	self._rimB.gradient.Rotation = angle
+	self._edge.gradient.Rotation = angle
+	self._outline.gradient.Rotation = outlineAngle
+	self._fringeC.gradient.Rotation = angle
+	self._fringeM.gradient.Rotation = angle
+
+	-- reflexo especular segue a luz; brilho secundário no lado oposto
+	self._streak.Position = UDim2.fromScale(0.5 + Lx * 0.27, 0.5 + Ly * 0.27)
+	self._streak.Rotation = math.deg(math.atan2(Lx, -Ly))
+	self._glint.Position = UDim2.fromScale(0.5 - Lx * 0.3, 0.5 - Ly * 0.3)
+
+	-- dispersão: franjas opostas, maiores quanto mais rápido o movimento
+	if cfg.dispersion > 0.02 then
+		local mag = cfg.dispersion * (0.7 + 1.6 * math.min(1, math.abs(leanX) + math.abs(leanY)))
+		local fx, fy = Lx * mag, Ly * mag
+		self._fringeC.frame.Position = UDim2.fromScale(fx / bw, fy / bh)
+		self._fringeM.frame.Position = UDim2.fromScale(-fx / bw, -fy / bh)
+	end
+
+	if self._provider and self._layers then
+		self:_updateLayers(ox, oy, bw, bh, pressNow, Lx, Ly, leanX, leanY)
+	end
+end
+
+function Glass:Destroy()
+	self._dead = true
+	self.Root:Destroy()
+end
+
+---------------------------------------------------------------- Toggle
+local function newHit(parent, extraW, extraH)
+	return make("TextButton", {
+		Name = "Hit",
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.5, 0.5),
+		Size = UDim2.new(1, extraW, 1, extraH),
+		BackgroundTransparency = 1,
+		AutoButtonColor = false,
+		Text = "",
+		ZIndex = 20,
+	}, parent)
+end
+
+function LiquidGlass.Toggle(parent, options)
+	options = options or {}
+	local track = options.trackSize or Vector2.new(58, 28)
+	local knob = options.knobSize or Vector2.new(38, 32)
+	local inset = options.inset or 2
+	local onColor = options.onColor or Color3.fromRGB(48, 209, 88)
+	local offColor = options.offColor or Color3.fromRGB(58, 58, 60)
+	local baseColor = options.backdropColor or BLACK
+	local travelMin = inset + knob.X / 2
+	local travelMax = track.X - inset - knob.X / 2
+
+	local root = make("Frame", {
+		Name = options.name or "LiquidToggle",
+		AnchorPoint = options.anchorPoint or Vector2.new(0, 0),
+		Position = options.position or UDim2.new(0, 0, 0, 0),
+		Size = UDim2.fromOffset(track.X, track.Y),
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+	}, parent)
+	local trackFrame = make("Frame", {
+		Name = "Track",
+		Size = UDim2.fromScale(1, 1),
+		BackgroundColor3 = offColor,
+		BorderSizePixel = 0,
+	}, root)
+	make("UICorner", { CornerRadius = PILL }, trackFrame)
+
+	local glassOptions = {}
+	for key, value in options do
+		glassOptions[key] = value
+	end
+	glassOptions.size = knob
+	glassOptions.position = UDim2.fromScale(0, 0.5)
+	glassOptions.name = "Knob"
+	local glass = LiquidGlass.new(root, glassOptions)
+	local hit = newHit(root, 8, 10)
+
+	local state = options.value == true
+	local spring = Spring.new(state and 1 or 0, 4.4, 0.6)
+	local dragging, startX, startP, moved = false, 0, 0, 0
+	local self = { Frame = root, Glass = glass, Track = trackFrame, Hit = hit, priority = 0, _dead = false }
+
+	local function knobX(p)
+		return lerp(travelMin, travelMax, math.clamp(p, -0.12, 1.12))
+	end
+	local function trackColor(p)
+		return offColor:Lerp(onColor, clamp01(p))
+	end
+	local function settleTune()
+		spring:tune(4.4 * glass.cfg.speed, dampingFor(glass.cfg))
+	end
+
+	glass:SetBackdrop(function()
+		local p = spring.x
+		return {
+			base = baseColor,
+			shapes = {
+				{ x = track.X / 2 - knobX(p), y = 0, w = track.X, h = track.Y, color = trackColor(p), transparency = 0 },
+			},
+		}
+	end)
+
+	local function place()
+		local p = spring.x
+		glass.Root.Position = UDim2.fromScale(knobX(p) / track.X, 0.5)
+		trackFrame.BackgroundColor3 = trackColor(p)
+	end
+	place()
+
+	local function setState(value, instant, silent)
+		local changed = value ~= state
+		state = value
+		spring.target = value and 1 or 0
+		if instant then
+			spring:snap(spring.target)
+			place()
+		end
+		settleTune()
+		glass:Invalidate()
+		if changed and not silent and options.onChanged then
+			task.spawn(options.onChanged, value)
+		end
+	end
+
+	function self:_update(dt)
+		if spring.x == spring.target and spring.v == 0 then
+			return -- em repouso: nada a escrever
+		end
+		spring:step(dt)
+		if spring:settled(0.001) then
+			spring:snap(spring.target)
+		end
+		place()
+		glass:SetMotion((travelMax - travelMin) * spring.v, 0)
+		glass:Invalidate()
+	end
+
+	local conns = bindDrag(hit, function(input)
+		dragging, startX, startP, moved = true, input.Position.X, spring.x, 0
+		glass:SetPressed(true)
+		spring:tune(8 * glass.cfg.speed, 0.78)
+	end, function(input)
+		local dx = input.Position.X - startX
+		moved = math.max(moved, math.abs(dx))
+		if moved > 3 then
+			spring.target = math.clamp(startP + dx / (travelMax - travelMin), -0.12, 1.12)
+		end
+	end, function()
+		dragging = false
+		glass:SetPressed(false)
+		local newState
+		if moved <= 3 then
+			newState = not state -- toque simples
+		else
+			newState = (spring.x + spring.v * 0.12) > 0.5 -- considera a inércia
+		end
+		setState(newState, false, false)
+		glass:Impulse(newState and 0.5 or -0.5, 0)
+	end)
+
+	function self:Set(value, instant)
+		setState(value == true, instant == true, true)
+	end
+	function self:Get()
+		return state
+	end
+	function self:IsDragging()
+		return dragging
+	end
+	function self:Destroy()
+		self._dead = true
+		for _, conn in conns do
+			conn:Disconnect()
+		end
+		glass:Destroy()
+		root:Destroy()
+	end
+
+	register(self, 0)
+	return self
+end
+
+---------------------------------------------------------------- Slider
+function LiquidGlass.Slider(parent, options)
+	options = options or {}
+	local length = options.length or 240
+	local railH = options.railHeight or 6
+	local thumb = options.thumbSize or Vector2.new(34, 34)
+	local minV, maxV = options.min or 0, options.max or 1
+	local stepV = options.step
+	local railColor = options.railColor or Color3.fromRGB(58, 58, 60)
+	local fillColor = options.fillColor or Color3.fromRGB(10, 132, 255)
+	local baseColor = options.backdropColor or BLACK
+	local tm = thumb.X / 2
+	local height = thumb.Y + 8
+
+	local root = make("Frame", {
+		Name = options.name or "LiquidSlider",
+		AnchorPoint = options.anchorPoint or Vector2.new(0, 0),
+		Position = options.position or UDim2.new(0, 0, 0, 0),
+		Size = UDim2.fromOffset(length, height),
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+	}, parent)
+	local rail = make("Frame", {
+		Name = "Rail",
+		AnchorPoint = Vector2.new(0, 0.5),
+		Position = UDim2.fromScale(0, 0.5),
+		Size = UDim2.fromOffset(length, railH),
+		BackgroundColor3 = railColor,
+		BorderSizePixel = 0,
+	}, root)
+	make("UICorner", { CornerRadius = PILL }, rail)
+	local fill = make("Frame", {
+		Name = "Fill",
+		Size = UDim2.fromScale(0, 1),
+		BackgroundColor3 = fillColor,
+		BorderSizePixel = 0,
+	}, rail)
+	make("UICorner", { CornerRadius = PILL }, fill)
+
+	local glassOptions = {}
+	for key, value in options do
+		glassOptions[key] = value
+	end
+	glassOptions.size = thumb
+	glassOptions.position = UDim2.fromScale(0, 0.5)
+	glassOptions.name = "Thumb"
+	local glass = LiquidGlass.new(root, glassOptions)
+	local hit = newHit(root, 0, 0)
+
+	local function valueOf(p)
+		local value = minV + clamp01(p) * (maxV - minV)
+		if stepV then
+			value = math.floor(value / stepV + 0.5) * stepV
+		end
+		return math.clamp(value, minV, maxV)
+	end
+	local function pOf(value)
+		if maxV == minV then
+			return 0
+		end
+		return clamp01((value - minV) / (maxV - minV))
+	end
+
+	local value = valueOf(pOf(options.value or minV))
+	local spring = Spring.new(pOf(value), 5, 0.7)
+	local grab = 0
+	local self = { Frame = root, Glass = glass, Hit = hit, priority = 0, _dead = false }
+
+	local function thumbX(p)
+		return lerp(tm, length - tm, math.clamp(p, -0.05, 1.05))
+	end
+	local function place()
+		local x = thumbX(spring.x)
+		glass.Root.Position = UDim2.fromScale(x / length, 0.5)
+		fill.Size = UDim2.fromScale(x / length, 1)
+	end
+	place()
+
+	glass:SetBackdrop(function()
+		local x = thumbX(spring.x)
+		return {
+			base = baseColor,
+			shapes = {
+				{ x = length / 2 - x, y = 0, w = length, h = railH, color = railColor, transparency = 0 },
+				{ x = -x / 2, y = 0, w = x, h = railH, color = fillColor, transparency = 0 },
+			},
+		}
+	end)
+
+	local function setTarget(p, silent)
+		local newValue = valueOf(p)
+		spring.target = pOf(newValue)
+		glass:Invalidate()
+		if newValue ~= value then
+			value = newValue
+			if not silent and options.onChanged then
+				task.spawn(options.onChanged, value)
+			end
+		end
+	end
+	local function pointerU(input)
+		local width = math.max(root.AbsoluteSize.X, 1)
+		return (input.Position.X - root.AbsolutePosition.X) / width
+	end
+	local function uToP(u)
+		return (u * length - tm) / (length - 2 * tm)
+	end
+
+	function self:_update(dt)
+		if spring.x == spring.target and spring.v == 0 then
+			return -- em repouso: nada a escrever
+		end
+		spring:step(dt)
+		if spring:settled(0.0005) then
+			spring:snap(spring.target)
+		end
+		place()
+		glass:SetMotion((length - 2 * tm) * spring.v, 0)
+		glass:Invalidate()
+	end
+
+	local conns = bindDrag(hit, function(input)
+		local u = pointerU(input)
+		local thumbU = thumbX(spring.x) / length
+		grab = math.abs(u - thumbU) <= tm / length and thumbU - u or 0
+		glass:SetPressed(true)
+		spring:tune(9 * glass.cfg.speed, 0.8)
+		setTarget(uToP(u + grab), false)
+	end, function(input)
+		setTarget(uToP(pointerU(input) + grab), false)
+	end, function()
+		glass:SetPressed(false)
+		spring:tune(5 * glass.cfg.speed, dampingFor(glass.cfg))
+		glass:Invalidate()
+	end)
+
+	function self:Set(newValue, instant)
+		setTarget(pOf(newValue), true)
+		if instant then
+			spring:snap(spring.target)
+			place()
+		end
+	end
+	function self:Get()
+		return value
+	end
+	function self:Destroy()
+		self._dead = true
+		for _, conn in conns do
+			conn:Disconnect()
+		end
+		glass:Destroy()
+		root:Destroy()
+	end
+
+	register(self, 0)
+	return self
+end
+
+---------------------------------------------------------------- Orb (gota livre)
+function LiquidGlass.Orb(parent, options)
+	options = options or {}
+	local area = options.area or Vector2.new(320, 200) -- tamanho em px do `parent`
+	local size = options.size or Vector2.new(64, 64)
+	local start = options.position or Vector2.new(area.X / 2, area.Y / 2)
+	local radius = (size.X + size.Y) / 4
+	local glassOptions = {}
+	for key, value in options do
+		glassOptions[key] = value
+	end
+	glassOptions.size = size
+	glassOptions.position = UDim2.fromScale(start.X / area.X, start.Y / area.Y)
+	glassOptions.name = options.name or "Orb"
+	local glass = LiquidGlass.new(parent, glassOptions)
+
+	local px = Spring.new(start.X, 3.2, 0.5)
+	local py = Spring.new(start.Y, 3.2, 0.5)
+	local home = options.home or start
+	local pullX, pullY = 0, 0
+	local dragging, startPointer, startPos = false, Vector2.new(0, 0), start
+	local self = { Glass = glass, Root = glass.Root, area = area, priority = 0, _dead = false }
+
+	local function clampPos(v)
+		return Vector2.new(math.clamp(v.X, radius, area.X - radius), math.clamp(v.Y, radius, area.Y - radius))
+	end
+	local function tuneFollow()
+		px:tune(7 * glass.cfg.speed, 0.8)
+		py:tune(7 * glass.cfg.speed, 0.8)
+	end
+	local function tuneSettle()
+		local z = dampingFor(glass.cfg)
+		px:tune(3.4 * glass.cfg.speed, z)
+		py:tune(3.4 * glass.cfg.speed, z)
+	end
+	tuneSettle()
+
+	if options.backdrop then
+		glass:SetBackdrop(function()
+			local data = options.backdrop()
+			local shapes = {}
+			for i, shape in data.shapes do
+				shapes[i] = {
+					x = shape.x - px.x,
+					y = shape.y - py.x,
+					w = shape.w,
+					h = shape.h,
+					color = shape.color,
+					transparency = shape.transparency,
+					radius = shape.radius,
+				}
+			end
+			return { base = data.base, baseTransparency = data.baseTransparency, shapes = shapes }
+		end)
+	end
+
+	function self:_update(dt)
+		if not dragging then
+			local rest = clampPos(Vector2.new(home.X + pullX, home.Y + pullY))
+			px.target, py.target = rest.X, rest.Y
+		end
+		if px.x == px.target and py.x == py.target and px.v == 0 and py.v == 0 then
+			return -- em repouso: nada a escrever
+		end
+		px:step(dt)
+		py:step(dt)
+		if px:settled(0.05) and py:settled(0.05) then
+			px:snap(px.target)
+			py:snap(py.target)
+		end
+		glass.Root.Position = UDim2.fromScale(px.x / area.X, py.x / area.Y)
+		glass:SetMotion(px.v, py.v)
+		glass:Invalidate()
+	end
+
+	local conns = {}
+	if options.draggable ~= false then
+		local hit = make("TextButton", {
+			Name = "Hit",
+			Size = UDim2.fromScale(1, 1),
+			BackgroundTransparency = 1,
+			AutoButtonColor = false,
+			Text = "",
+			ZIndex = 20,
+		}, glass.Root)
+		conns = bindDrag(hit, function(input)
+			dragging = true
+			startPointer = Vector2.new(input.Position.X, input.Position.Y)
+			startPos = Vector2.new(px.x, py.x)
+			glass:SetPressed(true)
+			tuneFollow()
+		end, function(input)
+			local target = clampPos(startPos + Vector2.new(input.Position.X, input.Position.Y) - startPointer)
+			px.target, py.target = target.X, target.Y
+		end, function()
+			dragging = false
+			glass:SetPressed(false)
+			if not options.returnHome then
+				home = Vector2.new(px.target, py.target) -- fica onde foi solto
+			end
+			tuneSettle()
+		end)
+	end
+
+	function self:GetCenter()
+		return Vector2.new(px.x, py.x)
+	end
+	function self:GetRadius()
+		return radius
+	end
+	function self:IsDragging()
+		return dragging
+	end
+	function self:SetPull(vector)
+		pullX, pullY = vector.X, vector.Y
+	end
+	function self:Destroy()
+		self._dead = true
+		for _, conn in conns do
+			conn:Disconnect()
+		end
+		glass:Destroy()
+	end
+
+	register(self, 0)
+	return self
+end
+
+---------------------------------------------------------------- Link (atração, fusão, desprendimento)
+function LiquidGlass.Link(a, b, options)
+	options = options or {}
+	local range = options.range or 0.8 -- alcance da atração, fração de (raioA + raioB)
+	local pullAmount = options.pull or 0.5 -- quanto a gota livre anda em direção à outra
+	local area = a.area
+	local parent = a.Glass.Root.Parent
+	local cfg = a.Glass.cfg
+
+	local neck = make("Frame", {
+		Name = "Neck",
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		BackgroundColor3 = cfg.tint,
+		BackgroundTransparency = math.min(1, cfg.transparency + 0.02),
+		BorderSizePixel = 0,
+		ZIndex = 0,
+		Visible = false,
+	}, parent)
+	make("UICorner", { CornerRadius = PILL }, neck)
+	local stroke = make("UIStroke", {
+		Color = WHITE,
+		Thickness = 1,
+		Transparency = 1 - 0.6 * clamp01(cfg.reflection),
+		ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+	}, neck)
+	make("UIGradient", { Transparency = seq({ 0, 1 }, { 0.2, 0.85 }, { 0.5, 0.45 }, { 0.8, 0.85 }, { 1, 1 }), Rotation = 0 }, stroke)
+
+	local self = { priority = 0.5, _dead = false }
+	local linked = false
+
+	local function release()
+		if linked then
+			linked = false
+			neck.Visible = false
+			a.Glass:Pull(0, 0, 0)
+			b.Glass:Pull(0, 0, 0)
+			a.Glass:SetMerge(1, 0, 0)
+			b.Glass:SetMerge(1, 0, 0)
+			a:SetPull(Vector2.new(0, 0))
+			b:SetPull(Vector2.new(0, 0))
+		end
+	end
+
+	function self:_update()
+		local ac, bc = a:GetCenter(), b:GetCenter()
+		local delta = bc - ac
+		local dist = delta.Magnitude
+		local ra, rb = a:GetRadius(), b:GetRadius()
+		local gap = dist - (ra + rb)
+		local reach = range * (ra + rb)
+		if dist < 0.001 or gap >= reach then
+			release()
+			return
+		end
+		linked = true
+		local dir = delta / dist
+		local closeness = clamp01(1 - gap / reach) -- 0 no limite do alcance, 1 em contato
+		local eased = closeness * closeness * (3 - 2 * closeness)
+
+		-- atração: cada gota se estica em direção à outra; a livre anda até ela
+		a.Glass:Pull(dir.X, dir.Y, 0.5 * eased)
+		b.Glass:Pull(-dir.X, -dir.Y, 0.5 * eased)
+		local travel = pullAmount * reach * eased
+		local aFree, bFree = not a:IsDragging(), not b:IsDragging()
+		if aFree and bFree then
+			a:SetPull(dir * (travel * 0.5))
+			b:SetPull(-dir * (travel * 0.5))
+		elseif bFree then
+			a:SetPull(Vector2.new(0, 0))
+			b:SetPull(-dir * travel)
+		elseif aFree then
+			a:SetPull(dir * travel)
+			b:SetPull(Vector2.new(0, 0))
+		end
+
+		-- fusão: os aros do lado de dentro somem; o pescoço liga as gotas e afina até soltar
+		local merge = clamp01(closeness * 1.4)
+		a.Glass:SetMerge(dir.X, dir.Y, merge)
+		b.Glass:SetMerge(-dir.X, -dir.Y, merge)
+		local startPoint = ac + dir * (ra * 0.6)
+		local endPoint = bc - dir * (rb * 0.6)
+		local length = (endPoint - startPoint):Dot(dir)
+		local thickness = math.min(ra, rb) * 1.56 * (1 - clamp01(gap / reach)) ^ 0.9
+		if length > 1 and thickness > 1.5 then
+			local mid = (startPoint + endPoint) / 2
+			neck.Visible = true
+			neck.Position = UDim2.fromScale(mid.X / area.X, mid.Y / area.Y)
+			neck.Size = UDim2.fromScale(length / area.X, thickness / area.Y)
+			neck.Rotation = math.deg(math.atan2(dir.Y, dir.X))
+		else
+			neck.Visible = false
+		end
+	end
+
+	function self:Destroy()
+		self._dead = true
+		release()
+		neck:Destroy()
+	end
+
+	register(self, 0.5)
+	return self
+end
+
+return LiquidGlass
