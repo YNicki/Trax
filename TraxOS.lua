@@ -11,6 +11,11 @@
 	fechar a ilha ela desgruda (estica, afina o pescoço e solta); ao abrir a
 	ilha ela é reabsorvida. Tocar na bolinha abre a ilha.
 
+	Dropdown: botão com troca animada do valor, seta com mola, painel que desce
+	com cascata de linhas, pílula de seleção que desliza e barra de busca (sem
+	acento, com destaque do trecho achado; Enter escolhe a primeira opção). A
+	lista rola acima de CONFIG.maxVisibleOptions. CONFIG.searchable = false remove a busca.
+
 	Vidro líquido: toggle e slider usam o módulo LiquidGlass quando ele é achado
 	(ModuleScript "LiquidGlass" filho deste script ou em ReplicatedStorage; no
 	executor: getgenv().LiquidGlass = loadstring(<código do módulo>)() antes de
@@ -40,6 +45,10 @@ type Config = {
 	sliderLabel: string,
 	dropdownLabel: string,
 	options: { string },
+	searchable: boolean,
+	searchPlaceholder: string,
+	emptyText: string,
+	maxVisibleOptions: number,
 	defaultOption: number,
 	defaultToggle: boolean,
 	defaultSlider: number,
@@ -67,7 +76,11 @@ local CONFIG: Config = {
 	toggleLabel = "Modo ativo",
 	sliderLabel = "Brilho",
 	dropdownLabel = "Qualidade",
-	options = { "Baixa", "Média", "Alta" },
+	options = { "Baixa", "Média", "Alta", "Ultra", "Cinema" },
+	searchable = true, -- barra de busca no topo da lista
+	searchPlaceholder = "Buscar...",
+	emptyText = "Nada encontrado",
+	maxVisibleOptions = 5, -- com mais opções que isso a lista rola
 	defaultOption = 3,
 	defaultToggle = true,
 	defaultSlider = 0.7, -- 0..1
@@ -180,13 +193,31 @@ local SLIDER_LEN, SLIDER_THUMB = 124, 30
 local EXPANDED_RADIUS = 30
 local TEXT_X = PAD + TILE_S + 10 -- onde começam os rótulos das linhas
 
+-- painel do dropdown: busca no topo + lista (rola acima de maxVisibleOptions)
+local SEARCHABLE = CONFIG.searchable
+local SEARCH_H = 30
+local PANEL_HEAD = if SEARCHABLE then SEARCH_H + 12 else 6 -- 6 acima + barra + 6 abaixo
+local PANEL_FOOT = 6
+local MAX_VISIBLE = math.max(1, math.floor(CONFIG.maxVisibleOptions))
+local PANEL_W = W - PAD * 2
+local ROW_X, ROW_W = 6, PANEL_W - 12
+
 local OPTIONS_Y = Y_DROP + ROW_H + 6
 local BASE_H = Y_DROP + ROW_H + PAD
-local OPEN_H = OPTIONS_Y + #CONFIG.options * OPT_H + PAD
+
+-- altura do painel pela quantidade de linhas visíveis (mínimo 1: é o "nada encontrado")
+local function panelHeight(count: number): number
+	return PANEL_HEAD + math.max(1, math.min(count, MAX_VISIBLE)) * OPT_H + PANEL_FOOT
+end
+
+local function islandOpenH(count: number): number
+	return OPTIONS_Y + panelHeight(count) + PAD
+end
+
+local OPEN_H = islandOpenH(#CONFIG.options) -- maior altura possível: tamanho do card interno
 
 local SIZE_COLLAPSED = UDim2.fromOffset(COLLAPSED.X, COLLAPSED.Y)
 local SIZE_EXPANDED = UDim2.fromOffset(W, BASE_H)
-local SIZE_OPEN = UDim2.fromOffset(W, OPEN_H)
 local PILL = UDim.new(1, 0)
 
 -- bolinha (coordenadas do "palco": mesmo centro da ilha, X a partir da esquerda do palco)
@@ -207,6 +238,11 @@ local FAST = TweenInfo.new(0.16, Enum.EasingStyle.Quad, Enum.EasingDirection.Out
 local FADE_IN = TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out, 0, false, 0.1)
 local SNAP = TweenInfo.new(0.22, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
 local POP = TweenInfo.new(0.4, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+local LIST_MOVE = TweenInfo.new(0.32, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
+local INDICATOR = TweenInfo.new(0.42, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+local VALUE = TweenInfo.new(0.28, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
+local CHEVRON = TweenInfo.new(0.4, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+local SLIDE_BACK = TweenInfo.new(0.42, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
 
 -- anel de progresso: dois semicírculos recortados + UIGradient com degrau em 0.5.
 -- Girar o gradiente de 0 a 180 (direita) e de 180 a 360 (esquerda) varre o anel.
@@ -226,7 +262,15 @@ local SWEEP = NumberSequence.new({
 })
 
 ---------------------------------------------------------------- helpers
-type OptionRow = { button: TextButton, label: TextLabel, dot: Frame }
+type OptionRow = {
+	group: CanvasGroup,
+	hover: Frame,
+	label: TextLabel,
+	checkScale: UIScale,
+	rowScale: UIScale,
+	button: TextButton,
+	shown: boolean,
+}
 type IconRef = { image: ImageLabel, name: string, fallback: Frame? }
 type ActivityKind = "progress" | "active" | "loading" | "done"
 type ActivityOptions = { icon: string?, label: string? }
@@ -275,16 +319,46 @@ end
 
 -- Um tween ativo por instância: religar o mesmo alvo cancela o anterior
 -- em vez de brigar com ele (cliques rápidos não deixam estado pela metade)
-local running: { [Instance]: Tween } = setmetatable({}, { __mode = "k" }) :: any
+-- Canais permitem tweens simultâneos na mesma instância sem brigar (ex.: tamanho x fade).
+local running: { [Instance]: { [string]: Tween } } = setmetatable({}, { __mode = "k" }) :: any
 
-local function play(inst: Instance, info: TweenInfo, goal: { [string]: any })
-	local previous = running[inst]
+local function play(inst: Instance, info: TweenInfo, goal: { [string]: any }, channel: string?)
+	local key = channel or "main"
+	local channels = running[inst]
+	if channels == nil then
+		channels = {}
+		running[inst] = channels
+	end
+	local previous = channels[key]
 	if previous then
 		previous:Cancel()
 	end
 	local tween = TweenService:Create(inst, info, goal)
-	running[inst] = tween
+	channels[key] = tween
 	tween:Play()
+end
+
+-- Aplica valores direto, cancelando o tween do canal (ou de todos, sem canal)
+local function snap(inst: Instance, props: { [string]: any }, channel: string?)
+	local channels = running[inst]
+	if channels then
+		if channel then
+			local tween = channels[channel]
+			if tween then
+				tween:Cancel()
+				channels[channel] = nil
+			end
+		else
+			for _, tween in channels do
+				tween:Cancel()
+			end
+			table.clear(channels)
+		end
+	end
+	local target: any = inst
+	for key, value in props do
+		target[key] = value
+	end
 end
 
 ---------------------------------------------------------------- ícones (Lucide / Craft)
@@ -948,22 +1022,37 @@ makeLabel(expandedGroup, {
 })
 local dropdownButton = apply(Instance.new("TextButton"), {
 	Name = "Dropdown",
-	AnchorPoint = Vector2.new(1, 0),
-	Position = UDim2.fromOffset(W - PAD, Y_DROP + (ROW_H - DROP_H) / 2),
+	AnchorPoint = Vector2.new(0.5, 0.5),
+	Position = UDim2.fromOffset(W - PAD - DROP_W / 2, Y_DROP + ROW_H / 2),
 	Size = UDim2.fromOffset(DROP_W, DROP_H),
 	BackgroundColor3 = COLOR.control,
 	BorderSizePixel = 0,
 	AutoButtonColor = false,
+	ClipsDescendants = true,
 	Text = "",
 }, expandedGroup)
 round(dropdownButton, UDim.new(0, 9))
-local dropdownText = makeLabel(dropdownButton, {
-	Name = "Value",
-	Position = UDim2.fromOffset(10, 0),
-	Size = UDim2.new(1, -32, 1, 0),
-	TextSize = 12,
-	Text = "",
-})
+local dropdownStroke = apply(Instance.new("UIStroke"), {
+	Color = COLOR.accent,
+	Transparency = 1,
+	Thickness = 1.2,
+	ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+}, dropdownButton)
+local dropdownScale = apply(Instance.new("UIScale"), { Scale = 1 }, dropdownButton)
+
+-- dois rótulos: o valor novo sobe e o antigo sai (troca animada)
+local function makeValueLabel(): TextLabel
+	return makeLabel(dropdownButton, {
+		Name = "Value",
+		Position = UDim2.fromOffset(10, 0),
+		Size = UDim2.new(1, -32, 1, 0),
+		TextSize = 12,
+		Text = "",
+	})
+end
+local valueCur = makeValueLabel()
+local valueAlt = makeValueLabel()
+valueAlt.TextTransparency = 1
 
 -- dois traços a ±45° formam o "v"; posição em escala porque Offset é inteiro
 local chevron = apply(Instance.new("Frame"), {
@@ -973,6 +1062,7 @@ local chevron = apply(Instance.new("Frame"), {
 	Size = UDim2.fromOffset(12, 9),
 	BackgroundTransparency = 1,
 }, dropdownButton)
+local chevronBars: { Frame } = {}
 for _, arm in { { x = 3.5 / 12, rotation = 45 }, { x = 8.5 / 12, rotation = -45 } } do
 	local bar = apply(Instance.new("Frame"), {
 		AnchorPoint = Vector2.new(0.5, 0.5),
@@ -983,45 +1073,216 @@ for _, arm in { { x = 3.5 / 12, rotation = 45 }, { x = 8.5 / 12, rotation = -45 
 		BorderSizePixel = 0,
 	}, chevron)
 	round(bar, UDim.new(0, 1))
+	table.insert(chevronBars, bar)
 end
 
+-- painel de opções: véu branco por cima do vidro da ilha
 local optionsPanel = apply(Instance.new("CanvasGroup"), {
 	Name = "Options",
 	Position = UDim2.fromOffset(PAD, OPTIONS_Y),
-	Size = UDim2.fromOffset(W - PAD * 2, #CONFIG.options * OPT_H),
-	BackgroundColor3 = COLOR.panel,
+	Size = UDim2.fromOffset(PANEL_W, panelHeight(#CONFIG.options)),
+	BackgroundColor3 = COLOR.text,
+	BackgroundTransparency = 0.93,
 	BorderSizePixel = 0,
 	GroupTransparency = 1,
 	Visible = false,
 }, expandedGroup)
-round(optionsPanel, UDim.new(0, 12))
+round(optionsPanel, UDim.new(0, 14))
+
+-- barra de busca ------------------------------------------------------
+local searchBar = apply(Instance.new("Frame"), {
+	Name = "Search",
+	Position = UDim2.fromOffset(ROW_X, 6),
+	Size = UDim2.fromOffset(ROW_W, SEARCH_H),
+	BackgroundColor3 = COLOR.text,
+	BackgroundTransparency = 0.9,
+	BorderSizePixel = 0,
+	Visible = SEARCHABLE,
+}, optionsPanel)
+round(searchBar, PILL)
+local searchStroke = apply(Instance.new("UIStroke"), {
+	Color = COLOR.accent,
+	Transparency = 1,
+	Thickness = 1.2,
+	ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+}, searchBar)
+
+-- lupa desenhada (sem depender de ícone): círculo com contorno + cabo a 45°
+local magnifier = apply(Instance.new("Frame"), {
+	Name = "Magnifier",
+	Position = UDim2.fromOffset(11, (SEARCH_H - 14) / 2),
+	Size = UDim2.fromOffset(14, 14),
+	BackgroundTransparency = 1,
+}, searchBar)
+local lensCircle = apply(Instance.new("Frame"), {
+	Size = UDim2.fromOffset(9, 9),
+	BackgroundTransparency = 1,
+	BorderSizePixel = 0,
+}, magnifier)
+round(lensCircle, PILL)
+local lensStroke = apply(Instance.new("UIStroke"), {
+	Color = COLOR.subtext,
+	Thickness = 1.6,
+	ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+}, lensCircle)
+local handleBar = apply(Instance.new("Frame"), {
+	AnchorPoint = Vector2.new(0.5, 0.5),
+	Position = UDim2.fromOffset(11.4, 11.4),
+	Size = UDim2.fromOffset(5, 1.8),
+	Rotation = 45,
+	BackgroundColor3 = COLOR.subtext,
+	BorderSizePixel = 0,
+}, magnifier)
+round(handleBar, PILL)
+
+local searchBox = apply(Instance.new("TextBox"), {
+	Name = "Input",
+	Position = UDim2.fromOffset(32, 0),
+	Size = UDim2.new(1, -32 - 30, 1, 0),
+	BackgroundTransparency = 1,
+	BorderSizePixel = 0,
+	ClearTextOnFocus = false,
+	FontFace = FONT.medium,
+	TextSize = 12,
+	TextColor3 = COLOR.text,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	PlaceholderText = CONFIG.searchPlaceholder,
+	PlaceholderColor3 = COLOR.subtext,
+	Text = "",
+}, searchBar)
+
+-- botão de limpar: aparece com pop quando há texto
+local clearButton = apply(Instance.new("TextButton"), {
+	Name = "Clear",
+	AnchorPoint = Vector2.new(1, 0.5),
+	Position = UDim2.new(1, -8, 0.5, 0),
+	Size = UDim2.fromOffset(16, 16),
+	BackgroundColor3 = COLOR.subtext,
+	BorderSizePixel = 0,
+	AutoButtonColor = false,
+	Text = "",
+}, searchBar)
+round(clearButton, PILL)
+local clearScale = apply(Instance.new("UIScale"), { Scale = 0 }, clearButton)
+for _, rotation in { 45, -45 } do
+	local bar = apply(Instance.new("Frame"), {
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.5, 0.5),
+		Size = UDim2.fromOffset(8, 1.6),
+		Rotation = rotation,
+		BackgroundColor3 = COLOR.ink,
+		BorderSizePixel = 0,
+	}, clearButton)
+	round(bar, PILL)
+end
+
+-- lista -----------------------------------------------------------------
+local list = apply(Instance.new("ScrollingFrame"), {
+	Name = "List",
+	Position = UDim2.fromOffset(0, PANEL_HEAD),
+	Size = UDim2.fromOffset(PANEL_W, math.min(#CONFIG.options, MAX_VISIBLE) * OPT_H),
+	BackgroundTransparency = 1,
+	BorderSizePixel = 0,
+	ClipsDescendants = true,
+	ScrollBarThickness = 2,
+	ScrollBarImageColor3 = COLOR.text,
+	ScrollBarImageTransparency = 0.7,
+	ScrollingDirection = Enum.ScrollingDirection.Y,
+	ElasticBehavior = Enum.ElasticBehavior.Never,
+	CanvasSize = UDim2.fromOffset(0, #CONFIG.options * OPT_H),
+	ScrollingEnabled = #CONFIG.options > MAX_VISIBLE,
+}, optionsPanel)
+
+-- pílula de seleção: desliza até a linha escolhida
+local indicator = apply(Instance.new("Frame"), {
+	Name = "Indicator",
+	Position = UDim2.fromOffset(ROW_X, 1),
+	Size = UDim2.fromOffset(ROW_W, OPT_H - 2),
+	BackgroundColor3 = COLOR.accent,
+	BackgroundTransparency = 1,
+	BorderSizePixel = 0,
+	ZIndex = 1,
+}, list)
+round(indicator, UDim.new(0, 10))
+local indicatorStroke = apply(Instance.new("UIStroke"), {
+	Color = COLOR.accent,
+	Transparency = 1,
+	Thickness = 1,
+	ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+}, indicator)
+
+local emptyLabel = makeLabel(optionsPanel, {
+	Name = "Empty",
+	Position = UDim2.fromOffset(0, PANEL_HEAD),
+	Size = UDim2.fromOffset(PANEL_W, OPT_H),
+	TextSize = 12,
+	TextColor3 = COLOR.subtext,
+	TextXAlignment = Enum.TextXAlignment.Center,
+	TextTransparency = 1,
+	Text = CONFIG.emptyText,
+})
 
 local optionRows: { OptionRow } = {}
 for index, name in CONFIG.options do
-	local button = apply(Instance.new("TextButton"), {
+	local group = apply(Instance.new("CanvasGroup"), {
 		Name = "Option" .. index,
-		Position = UDim2.fromOffset(0, (index - 1) * OPT_H),
-		Size = UDim2.fromOffset(W - PAD * 2, OPT_H),
+		Position = UDim2.fromOffset(ROW_X, (index - 1) * OPT_H + 1),
+		Size = UDim2.fromOffset(ROW_W, OPT_H - 2),
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		ZIndex = 2,
+	}, list)
+	local rowScale = apply(Instance.new("UIScale"), { Scale = 1 }, group)
+	local hover = apply(Instance.new("Frame"), {
+		Size = UDim2.fromScale(1, 1),
 		BackgroundColor3 = COLOR.text,
 		BackgroundTransparency = 1, -- só acende no hover
 		BorderSizePixel = 0,
-		AutoButtonColor = false,
-		Text = "",
-	}, optionsPanel)
-	local text = makeLabel(button, {
+	}, group)
+	round(hover, UDim.new(0, 10))
+	local text = makeLabel(group, {
 		Position = UDim2.fromOffset(14, 0),
-		Size = UDim2.new(1, -40, 1, 0),
+		Size = UDim2.new(1, -44, 1, 0),
+		TextColor3 = COLOR.subtext,
+		RichText = true,
 		Text = name,
 	})
-	local dot = apply(Instance.new("Frame"), {
+	-- check desenhado; entra com pop na opção escolhida
+	local checkBox = apply(Instance.new("Frame"), {
 		AnchorPoint = Vector2.new(1, 0.5),
-		Position = UDim2.new(1, -14, 0.5, 0),
-		Size = UDim2.fromOffset(7, 7),
-		BackgroundColor3 = COLOR.accent,
-		BorderSizePixel = 0,
-	}, button)
-	round(dot, PILL)
-	table.insert(optionRows, { button = button, label = text, dot = dot })
+		Position = UDim2.new(1, -12, 0.5, 0),
+		Size = UDim2.fromOffset(14, 14),
+		BackgroundTransparency = 1,
+	}, group)
+	local checkScale = apply(Instance.new("UIScale"), { Scale = 0 }, checkBox)
+	for _, seg in { { 3.95, 9.35, 4.95, 45 }, { 8.75, 7.55, 9.36, -49.3 } } do
+		local bar = apply(Instance.new("Frame"), {
+			AnchorPoint = Vector2.new(0.5, 0.5),
+			Position = UDim2.fromScale(seg[1] / 14, seg[2] / 14),
+			Size = UDim2.fromScale((seg[3] + 1.2) / 14, 2.4 / 14),
+			Rotation = seg[4],
+			BackgroundColor3 = COLOR.accent,
+			BorderSizePixel = 0,
+		}, checkBox)
+		round(bar, PILL)
+	end
+	local button = apply(Instance.new("TextButton"), {
+		Name = "Hit",
+		Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1,
+		AutoButtonColor = false,
+		Text = "",
+		ZIndex = 5,
+	}, group)
+	table.insert(optionRows, {
+		group = group,
+		hover = hover,
+		label = text,
+		checkScale = checkScale,
+		rowScale = rowScale,
+		button = button,
+		shown = true,
+	})
 end
 
 ---------------------------------------------------------------- estado
@@ -1278,13 +1539,278 @@ local function renderToggle(animate: boolean)
 	end
 end
 
-local function renderSelection()
-	dropdownText.Text = CONFIG.options[selected]
+---------------------------------------------------------------- dropdown: busca, lista e animações
+local query = ""
+local visibleIdx: { number } = {} -- índices das opções que passam no filtro, na ordem
+local visiblePos: { [number]: number } = {} -- índice da opção -> posição na lista
+local optionsShown = false
+local ACCENT_HEX = "#" .. COLOR.accent:ToHex()
+
+-- busca sem acento e sem diferença de maiúscula: "media" acha "Média"
+local FOLD: { [string]: string } = {}
+local ACCENTED: { [string]: string } = {
+	a = "áàâãäÁÀÂÃÄ",
+	e = "éèêëÉÈÊË",
+	i = "íìîïÍÌÎÏ",
+	o = "óòôõöÓÒÔÕÖ",
+	u = "úùûüÚÙÛÜ",
+	c = "çÇ",
+	n = "ñÑ",
+}
+for base, letters in ACCENTED do
+	for _, code in utf8.codes(letters) do
+		FOLD[utf8.char(code)] = base
+	end
+end
+
+local function toChars(text: string): { string }
+	local out: { string } = {}
+	local ok = pcall(function()
+		for _, code in utf8.codes(text) do
+			table.insert(out, utf8.char(code))
+		end
+	end)
+	if not ok then
+		return { text } -- UTF-8 inválido: trata como um bloco só
+	end
+	return out
+end
+
+local function foldChars(chars: { string }): { string }
+	local out: { string } = {}
+	for i, char in chars do
+		out[i] = FOLD[char] or string.lower(char)
+	end
+	return out
+end
+
+local function findChars(hay: { string }, needle: { string }): number?
+	local n, m = #hay, #needle
+	if m == 0 or m > n then
+		return nil
+	end
+	for start = 1, n - m + 1 do
+		local found = true
+		for k = 1, m do
+			if hay[start + k - 1] ~= needle[k] then
+				found = false
+				break
+			end
+		end
+		if found then
+			return start
+		end
+	end
+	return nil
+end
+
+-- posição (em caracteres) onde a busca casa; busca vazia casa com tudo
+local function matchRange(name: string, q: string): (number?, number)
+	if q == "" then
+		return 1, 0
+	end
+	local needle = foldChars(toChars(q))
+	return findChars(foldChars(toChars(name)), needle), #needle
+end
+
+local function escapeRich(text: string): string
+	local out = string.gsub(text, "&", "&amp;")
+	out = string.gsub(out, "<", "&lt;")
+	out = string.gsub(out, ">", "&gt;")
+	return out
+end
+
+-- destaca o trecho encontrado em azul e negrito
+local function highlight(name: string, q: string): string
+	if q == "" then
+		return escapeRich(name)
+	end
+	local start, length = matchRange(name, q)
+	if start == nil then
+		return escapeRich(name)
+	end
+	local chars = toChars(name)
+	local pre = table.concat(chars, "", 1, start - 1)
+	local mid = table.concat(chars, "", start, start + length - 1)
+	local post = table.concat(chars, "", start + length)
+	return escapeRich(pre) .. '<font color="' .. ACCENT_HEX .. '"><b>' .. escapeRich(mid) .. "</b></font>" .. escapeRich(post)
+end
+
+local function rowPosition(pos: number): UDim2
+	return UDim2.fromOffset(ROW_X, (pos - 1) * OPT_H + 1)
+end
+
+local function islandGoal(size: UDim2): { [string]: any }
+	local glassPanel = CONFIG.panelGlass and expanded
+	return {
+		Size = size,
+		BackgroundTransparency = if glassPanel then CONFIG.panelTransparency else 0,
+		BackgroundColor3 = if glassPanel then COLOR.glassPanel else COLOR.bg,
+	}
+end
+
+-- valor do botão: o novo sobe, o antigo sai
+local function setValueText(text: string, animate: boolean)
+	if valueCur.Text == text then
+		return
+	end
+	if not animate then
+		snap(valueCur, { Text = text, TextTransparency = 0, Position = UDim2.fromOffset(10, 0) })
+		return
+	end
+	local incoming, outgoing = valueAlt, valueCur
+	snap(incoming, { Text = text, TextTransparency = 1, Position = UDim2.fromOffset(10, 9) })
+	play(incoming, VALUE, { Position = UDim2.fromOffset(10, 0), TextTransparency = 0 })
+	play(outgoing, VALUE, { Position = UDim2.fromOffset(10, -9), TextTransparency = 1 })
+	valueCur, valueAlt = incoming, outgoing
+end
+
+local function moveIndicator(animate: boolean, info: TweenInfo)
+	local pos = visiblePos[selected]
+	if pos then
+		local target = rowPosition(pos)
+		if animate and indicator.BackgroundTransparency < 0.95 then
+			play(indicator, info, { Position = target })
+		else
+			snap(indicator, { Position = target })
+		end
+		play(indicator, FAST, { BackgroundTransparency = 0.82 }, "fade")
+		play(indicatorStroke, FAST, { Transparency = 0.6 })
+	else
+		play(indicator, FAST, { BackgroundTransparency = 1 }, "fade")
+		play(indicatorStroke, FAST, { Transparency = 1 })
+	end
+end
+
+local function renderSelection(animate: boolean)
+	setValueText(CONFIG.options[selected], animate)
 	for index, row in optionRows do
 		local isSelected = index == selected
-		row.dot.Visible = isSelected
-		row.label.TextColor3 = if isSelected then COLOR.text else COLOR.subtext
+		local color = if isSelected then COLOR.text else COLOR.subtext
+		local checkGoal = if isSelected then 1 else 0
+		if animate then
+			play(row.label, FAST, { TextColor3 = color })
+			play(row.checkScale, POP, { Scale = checkGoal })
+		else
+			snap(row.label, { TextColor3 = color })
+			snap(row.checkScale, { Scale = checkGoal })
+		end
 	end
+	moveIndicator(animate, INDICATOR)
+end
+
+-- aplica a busca: linhas que saem somem, as que ficam deslizam, o painel e a ilha encolhem
+local function applyFilter(animate: boolean)
+	table.clear(visibleIdx)
+	table.clear(visiblePos)
+	for index, name in CONFIG.options do
+		if matchRange(name, query) ~= nil then
+			table.insert(visibleIdx, index)
+			visiblePos[index] = #visibleIdx
+		end
+	end
+	local count = #visibleIdx
+
+	for index, row in optionRows do
+		local pos = visiblePos[index]
+		row.label.Text = highlight(CONFIG.options[index], query)
+		if pos then
+			local target = rowPosition(pos)
+			if not animate then
+				snap(row.group, { Position = target, GroupTransparency = 0, Visible = true })
+			elseif row.shown then
+				play(row.group, LIST_MOVE, { Position = target, GroupTransparency = 0 })
+			else
+				snap(row.group, { Position = target + UDim2.fromOffset(0, 8), GroupTransparency = 1, Visible = true })
+				play(row.group, LIST_MOVE, { Position = target, GroupTransparency = 0 })
+			end
+			row.shown = true
+		else
+			row.shown = false
+			if animate then
+				play(row.group, FAST, { GroupTransparency = 1 })
+				task.delay(FAST.Time + 0.02, function()
+					if not row.shown then
+						row.group.Visible = false -- invisível não pode interceptar toque
+					end
+				end)
+			else
+				snap(row.group, { GroupTransparency = 1, Visible = false })
+			end
+		end
+	end
+
+	list.CanvasSize = UDim2.fromOffset(0, math.max(count, 1) * OPT_H)
+	list.ScrollingEnabled = count > MAX_VISIBLE
+	if count <= MAX_VISIBLE then
+		list.CanvasPosition = Vector2.new(0, 0)
+	end
+	play(emptyLabel, FAST, { TextTransparency = if count == 0 then 0 else 1 })
+
+	local listH = math.max(1, math.min(count, MAX_VISIBLE)) * OPT_H
+	local panelSize = UDim2.fromOffset(PANEL_W, panelHeight(count))
+	local listSize = UDim2.fromOffset(PANEL_W, listH)
+	if animate then
+		play(optionsPanel, RESIZE, { Size = panelSize }, "size")
+		play(list, RESIZE, { Size = listSize }, "size")
+		if expanded and dropdownOpen then
+			play(island, RESIZE, islandGoal(UDim2.fromOffset(W, islandOpenH(count))))
+		end
+	else
+		snap(optionsPanel, { Size = panelSize }, "size")
+		snap(list, { Size = listSize }, "size")
+	end
+	moveIndicator(animate, LIST_MOVE)
+end
+
+local function setQuery(text: string)
+	local trimmed = string.match(text, "^%s*(.-)%s*$") or text
+	if trimmed == query then
+		return
+	end
+	query = trimmed
+	applyFilter(true)
+end
+
+local function resetSearch()
+	query = ""
+	searchBox.Text = ""
+end
+
+-- abertura: a barra de busca desce com mola e as linhas entram em cascata
+local function playOpen()
+	snap(searchBar, { Position = UDim2.fromOffset(ROW_X, -10) }, "pos")
+	play(searchBar, SLIDE_BACK, { Position = UDim2.fromOffset(ROW_X, 6) }, "pos")
+	for pos, index in visibleIdx do
+		local row = optionRows[index]
+		local target = rowPosition(pos)
+		snap(row.group, { Position = target - UDim2.fromOffset(14, 0), GroupTransparency = 1 })
+		local delay = 0.06 + math.min(pos - 1, 6) * 0.04
+		play(
+			row.group,
+			TweenInfo.new(0.36, Enum.EasingStyle.Quint, Enum.EasingDirection.Out, 0, false, delay),
+			{ Position = target, GroupTransparency = 0 }
+		)
+	end
+	local pos = visiblePos[selected]
+	if pos then
+		local maxScroll = math.max(0, #visibleIdx * OPT_H - MAX_VISIBLE * OPT_H)
+		list.CanvasPosition = Vector2.new(0, math.clamp((pos - 2) * OPT_H, 0, maxScroll))
+		local late = TweenInfo.new(0.3, Enum.EasingStyle.Quad, Enum.EasingDirection.Out, 0, false, 0.24)
+		snap(indicator, { Position = rowPosition(pos), BackgroundTransparency = 1 })
+		snap(indicatorStroke, { Transparency = 1 })
+		play(indicator, late, { BackgroundTransparency = 0.82 }, "fade")
+		play(indicatorStroke, late, { Transparency = 0.6 })
+	end
+end
+
+local function focusSearch(on: boolean)
+	touch()
+	play(searchStroke, FAST, { Transparency = if on then 0.35 else 1 })
+	play(searchBar, FAST, { BackgroundTransparency = if on then 0.84 else 0.9 })
+	local color = if on then COLOR.accent else COLOR.subtext
+	play(lensStroke, FAST, { Color = color })
+	play(handleBar, FAST, { BackgroundColor3 = color })
 end
 
 local function render()
@@ -1296,7 +1822,7 @@ local function render()
 	local radius: number
 	local info: TweenInfo
 	if expanded then
-		size = if dropdownOpen then SIZE_OPEN else SIZE_EXPANDED
+		size = if dropdownOpen then UDim2.fromOffset(W, islandOpenH(#visibleIdx)) else SIZE_EXPANDED
 		radius = EXPANDED_RADIUS
 		info = if shownExpanded then RESIZE else EXPAND
 	else
@@ -1307,11 +1833,7 @@ local function render()
 	local glassPanel = CONFIG.panelGlass and expanded
 	islandStrokeT = if glassPanel then 0.4 else STROKE_T
 	strokeGradient.Enabled = glassPanel
-	play(island, info, {
-		Size = size,
-		BackgroundTransparency = if glassPanel then CONFIG.panelTransparency else 0,
-		BackgroundColor3 = if glassPanel then COLOR.glassPanel else COLOR.bg,
-	})
+	play(island, info, islandGoal(size))
 	play(islandStroke, FAST, { Transparency = islandStrokeT })
 	play(corner, info, { CornerRadius = UDim.new(0, radius) })
 	play(scale, FAST, { Scale = 1 })
@@ -1327,14 +1849,25 @@ local function render()
 	end
 
 	local showOptions = expanded and dropdownOpen
-	play(chevron, FAST, { Rotation = if showOptions then 180 else 0 })
+	play(chevron, CHEVRON, { Rotation = if showOptions then 180 else 0 })
+	for _, bar in chevronBars do
+		play(bar, FAST, { BackgroundColor3 = if showOptions then COLOR.accent else COLOR.subtext })
+	end
 	play(dropdownButton, FAST, { BackgroundColor3 = if showOptions then COLOR.controlActive else COLOR.control })
+	play(dropdownStroke, FAST, { Transparency = if showOptions then 0.45 else 1 })
 	if showOptions then
 		optionsPanel.Visible = true
-		play(optionsPanel, FAST, { GroupTransparency = 0 })
+		if not optionsShown then
+			snap(optionsPanel, { Position = UDim2.fromOffset(PAD, OPTIONS_Y - 10), GroupTransparency = 1 })
+		end
+		play(optionsPanel, SLIDE_BACK, { GroupTransparency = 0, Position = UDim2.fromOffset(PAD, OPTIONS_Y) })
 	else
 		play(optionsPanel, FAST, { GroupTransparency = 1 })
+		if searchBox:IsFocused() then
+			searchBox:ReleaseFocus()
+		end
 	end
+	optionsShown = showOptions
 
 	-- esconde só depois do fade; invisível, o card não intercepta cliques da pílula.
 	-- O token descarta o callback se outro render começou nesse meio tempo.
@@ -1367,8 +1900,15 @@ local function setDropdownOpen(value: boolean)
 		return
 	end
 	dropdownOpen = value
+	if value then
+		resetSearch() -- sempre abre com a lista inteira
+		applyFilter(false)
+	end
 	touch()
 	render()
+	if value then
+		playOpen()
+	end
 end
 
 local function setName(text: string)
@@ -1395,7 +1935,7 @@ local function selectOption(index: number): boolean
 	end
 	local changed = index ~= selected
 	selected = index
-	renderSelection()
+	renderSelection(true)
 	setDropdownOpen(false)
 	touch()
 	local callback = CONFIG.onSelect
@@ -1467,6 +2007,43 @@ end))
 track(dropdownButton.Activated:Connect(function()
 	setDropdownOpen(not dropdownOpen)
 end))
+track(dropdownButton.MouseButton1Down:Connect(function()
+	play(dropdownScale, FAST, { Scale = 0.94 })
+end))
+track(dropdownButton.MouseButton1Up:Connect(function()
+	play(dropdownScale, SNAP, { Scale = 1 })
+end))
+track(dropdownButton.MouseEnter:Connect(function()
+	if not dropdownOpen then
+		play(dropdownButton, FAST, { BackgroundColor3 = COLOR.controlActive })
+	end
+end))
+track(dropdownButton.MouseLeave:Connect(function()
+	play(dropdownScale, SNAP, { Scale = 1 })
+	if not dropdownOpen then
+		play(dropdownButton, FAST, { BackgroundColor3 = COLOR.control })
+	end
+end))
+
+-- busca
+track(searchBox:GetPropertyChangedSignal("Text"):Connect(function()
+	touch()
+	play(clearScale, POP, { Scale = if searchBox.Text ~= "" then 1 else 0 })
+	setQuery(searchBox.Text)
+end))
+track(searchBox.Focused:Connect(function()
+	focusSearch(true)
+end))
+track(searchBox.FocusLost:Connect(function(enterPressed: boolean)
+	focusSearch(false)
+	if enterPressed and #visibleIdx > 0 then
+		selectOption(visibleIdx[1]) -- Enter escolhe a primeira opção filtrada
+	end
+end))
+track(clearButton.Activated:Connect(function()
+	searchBox.Text = ""
+	searchBox:CaptureFocus()
+end))
 track(island.MouseMoved:Connect(function()
 	touch() -- lendo/pairando o mouse sobre a ilha não conta como inatividade
 end))
@@ -1476,10 +2053,17 @@ for index, row in optionRows do
 		selectOption(index)
 	end))
 	track(row.button.MouseEnter:Connect(function()
-		play(row.button, FAST, { BackgroundTransparency = 0.92 })
+		play(row.hover, FAST, { BackgroundTransparency = 0.92 })
 	end))
 	track(row.button.MouseLeave:Connect(function()
-		play(row.button, FAST, { BackgroundTransparency = 1 })
+		play(row.hover, FAST, { BackgroundTransparency = 1 })
+		play(row.rowScale, SNAP, { Scale = 1 })
+	end))
+	track(row.button.MouseButton1Down:Connect(function()
+		play(row.rowScale, FAST, { Scale = 0.96 })
+	end))
+	track(row.button.MouseButton1Up:Connect(function()
+		play(row.rowScale, SNAP, { Scale = 1 })
 	end))
 end
 
@@ -1533,7 +2117,8 @@ task.spawn(function()
 end)
 
 ---------------------------------------------------------------- start
-renderSelection()
+applyFilter(false)
+renderSelection(false)
 renderToggle(false)
 renderStatus()
 gui.Parent = guiParent
